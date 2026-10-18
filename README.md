@@ -1,6 +1,8 @@
 # Entropy Backup
 
-**Save yourself the headache of managing your backups.** Entropy Backup is a simple yet effective native Windows 11 app for incremental, versioned project backups, with a modern frosted-glass UI.
+**When Entropy is back UP, launch EntropyBackup!....exe** 🙃
+
+Entropy Backup is a simple yet effective native Windows 11 app for incremental, versioned project backups, with a modern frosted-glass UI.
 
 ![Entropy Backup — backup page](docs/screenshots/backup.png)
 

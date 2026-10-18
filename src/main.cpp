@@ -1631,9 +1631,10 @@ static void DrawAboutPage() {
     DrawLogo(420, 222, 50);
     Text(L"Entropy Backup", RC(492, 180, 1000, 222), 30, C(0xF7F9FC), SEMI);
     Text(std::wstring(L"Version ") + APP_VERSION + L"  \u00B7  Native Windows 11 x64  \u00B7  C++20, Direct2D, DirectWrite", RC(494, 222, 1088, 248), 15, C(0xEBC56C));
+    Text(L"When Entropy is back UP, launch EntropyBackup!....exe", RC(360, 256, 1088, 282), 16, C(0xF3F6FA), SEMI);
     Text(L"Entropy Backup keeps immutable, timestamped snapshots of your projects. Each snapshot is a complete, browsable copy, "
          L"while files that did not change are hard-linked to the previous snapshot so they take no additional space.",
-         RC(360, 290, 1088, 350), 15.5f, C(0xDCE4EE), REG, LEFT, true, VTOP);
+         RC(360, 294, 1088, 354), 15.5f, C(0xDCE4EE), REG, LEFT, true, VTOP);
     Text(L"How it works", RC(360, 366, 800, 394), 18, C(0xEBC56C), SEMI);
     const wchar_t* pts[] = {
         L"Each backup is written to a temporary folder and renamed to snapshot_YYYY-MM-DD_HH-MM-SS only once it is complete.",

@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- New slogan: "When Entropy is back UP, launch EntropyBackup!....exe", shown in the README and on the About page.
+
 ## 1.5.0
 - New **Section Outline** settings: one switch outlines every section with a two-colour gradient.
   - Pick both colours with the Windows colour picker; a swap button and a live preview bar are included.
