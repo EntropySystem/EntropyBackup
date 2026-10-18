@@ -18,12 +18,17 @@
 #include <vss.h>
 #include <vswriter.h>
 #include <vsbackup.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <map>
+#include <future>
 #include <mutex>
 #include <random>
 #include <string>
@@ -38,16 +43,19 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 using Microsoft::WRL::ComPtr;
 
-static const wchar_t* APP_VERSION = L"1.7.0";
+static const wchar_t* APP_VERSION = L"1.8.0";
 static const wchar_t* CLS = L"EntropyBackupGlassWindow";
 static const float DW = 1480.f, DH = 950.f;   // design canvas, scaled uniformly to the window
 static const float PI = 3.14159265f;
-static const UINT WM_APP_JOBDONE = WM_APP + 1;
-static const UINT_PTR T_ANIM = 1, T_HIST = 2;
+static const UINT WM_APP_JOBDONE = WM_APP + 1, WM_APP_FRAME = WM_APP + 2;
+static const UINT_PTR T_ANIM = 1, T_HIST = 2, T_FX = 3;
 static const COLORREF FIELD_GDI = RGB(0x17, 0x2B, 0x45);
 static const UINT32 FIELD_HEX = 0x172B45;
 
@@ -289,6 +297,9 @@ struct Settings {
     bool outline = false, outSpan = false;
     UINT32 outA = 0xF2CF7A, outB = 0x5CCBFF;  // 0xRRGGBB
     int outStyle = 2, outWidth = 30, outGlow = 40;
+    // Animated glow: calm effects layered on the outline (bit 0 pulse, 1 flow, 2 shimmer, 3 drift) and their speed.
+    bool glowAnim = false;
+    int glowFx = 3, glowSpeed = 30;
     // Automation: schedule (0 off, 1 hourly, 2 daily, 3 weekly; day 0 = Sunday), retention (0 = no limit) and integrity.
     int schedMode = 2, schedHour = 2, schedMin = 0, schedDay = 1, keepCount = 0, keepDays = 0;
     bool shadow = false, checksums = false, verifyAfter = false;
@@ -329,6 +340,9 @@ static void LoadSettings() {
     cfg.outStyle = std::clamp(iniInt(L"OutlineStyle", 2), 0, 5);
     cfg.outWidth = std::clamp(iniInt(L"OutlineWidth", 30), 0, 100);
     cfg.outGlow = std::clamp(iniInt(L"OutlineGlow", 40), 0, 100);
+    cfg.glowAnim = IniBool(L"GlowAnimate", false);
+    cfg.glowFx = std::clamp(iniInt(L"GlowEffects", 3), 1, 15);
+    cfg.glowSpeed = std::clamp(iniInt(L"GlowSpeed", 30), 0, 100);
     cfg.bgImage = IniGet(L"BackgroundImage", L"");
     cfg.schedMode = std::clamp(iniInt(L"ScheduleMode", 2), 0, 3);
     cfg.schedHour = std::clamp(iniInt(L"ScheduleHour", 2), 0, 23);
@@ -369,6 +383,9 @@ static void SaveSettings() {
     IniSet(L"OutlineStyle", std::to_wstring(cfg.outStyle));
     IniSet(L"OutlineWidth", std::to_wstring(cfg.outWidth));
     IniSet(L"OutlineGlow", std::to_wstring(cfg.outGlow));
+    IniSet(L"GlowAnimate", cfg.glowAnim ? L"1" : L"0");
+    IniSet(L"GlowEffects", std::to_wstring(cfg.glowFx));
+    IniSet(L"GlowSpeed", std::to_wstring(cfg.glowSpeed));
     IniSet(L"BackgroundImage", cfg.bgImage);
     IniSet(L"ScheduleMode", std::to_wstring(cfg.schedMode));
     IniSet(L"ScheduleHour", std::to_wstring(cfg.schedHour));
@@ -1258,6 +1275,156 @@ static void VerifyWorker(std::wstring snapDir, VerifyResult* out) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Video background: Media Foundation decodes a looping, muted clip on its own thread (at most 30 fps)
+// and hands the newest frame to the window, which draws it as the backdrop and re-blurs the glass.
+// ---------------------------------------------------------------------------------------------
+static bool IsVideoFile(const std::wstring& f) {
+    std::wstring e = Lower(f.substr(f.find_last_of(L'.') == std::wstring::npos ? f.size() : f.find_last_of(L'.')));
+    for (auto x : {L".mp4", L".m4v", L".mov", L".wmv", L".avi", L".mkv"}) if (e == x) return true;
+    return false;
+}
+class VideoBg {
+    std::thread th;
+    std::mutex m;
+    std::condition_variable cv;
+    bool stop = false, paused = false, fresh = false;
+    std::vector<BYTE> frame;  // newest frame, BGRX, top-down, tightly packed
+    UINT fw = 0, fh = 0;
+    void Run(std::wstring path, std::promise<std::wstring>* opened);
+public:
+    std::wstring file;
+    bool Active() const { return th.joinable(); }
+    // Starts playing `path`. Returns "" on success, otherwise why it cannot be played.
+    std::wstring Open(const std::wstring& path) {
+        Close();
+        std::promise<std::wstring> p;
+        auto f = p.get_future();
+        stop = paused = fresh = false;
+        th = std::thread(&VideoBg::Run, this, path, &p);
+        std::wstring why = f.get();
+        if (!why.empty()) Close();
+        else file = path;
+        return why;
+    }
+    void Close() {
+        { std::lock_guard l(m); stop = true; }
+        cv.notify_all();
+        if (th.joinable()) th.join();
+        file.clear();
+        frame.clear();
+        fw = fh = 0;
+    }
+    void Pause(bool p) {
+        { std::lock_guard l(m); paused = p; }
+        cv.notify_all();
+    }
+    // Moves the newest frame into `out` if there is one the window has not drawn yet.
+    bool Take(std::vector<BYTE>& out, UINT& w, UINT& h) {
+        std::lock_guard l(m);
+        if (!fresh) return false;
+        out.swap(frame);
+        w = fw; h = fh;
+        fresh = false;
+        return true;
+    }
+    ~VideoBg() { Close(); }
+};
+void VideoBg::Run(std::wstring path, std::promise<std::wstring>* opened) {
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    {
+        ComPtr<IMFSourceReader> rd;
+        ComPtr<IMFAttributes> at;
+        ComPtr<IMFMediaType> want, cur;
+        UINT32 w = 0, h = 0;
+        LONG stride = 0;
+        auto readFormat = [&]() -> bool {
+            cur.Reset();
+            if (FAILED(rd->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &cur)) || FAILED(MFGetAttributeSize(cur.Get(), MF_MT_FRAME_SIZE, &w, &h)) || !w || !h) return false;
+            stride = (LONG)MFGetAttributeUINT32(cur.Get(), MF_MT_DEFAULT_STRIDE, w * 4);
+            return true;
+        };
+        HRESULT hr = MFCreateAttributes(&at, 1);
+        if (SUCCEEDED(hr)) hr = at->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);  // colour conversion to RGB32
+        if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromURL(path.c_str(), at.Get(), &rd);
+        if (SUCCEEDED(hr)) hr = rd->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE);  // no audio: the backdrop is silent
+        if (SUCCEEDED(hr)) hr = rd->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&want);
+        if (SUCCEEDED(hr)) hr = want->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        if (SUCCEEDED(hr)) hr = want->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        if (SUCCEEDED(hr)) hr = rd->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, want.Get());
+        if (SUCCEEDED(hr) && !readFormat()) hr = E_FAIL;
+        if (FAILED(hr)) {
+            wchar_t b[96];
+            swprintf_s(b, L"Windows cannot play this video (0x%08lX). Try an H.264 .mp4.", (unsigned long)hr);
+            opened->set_value(b);
+        } else {
+            opened->set_value(L"");
+            using clock = std::chrono::steady_clock;
+            const LONGLONG MIN_GAP = 330000;  // 33 ms in 100 ns units: at most 30 frames per second
+            clock::time_point t0{};
+            LONGLONG ts0 = -1, last = -1;
+            std::vector<BYTE> buf;
+            for (;;) {
+                {
+                    std::unique_lock l(m);
+                    if (paused) { cv.wait(l, [&] { return stop || !paused; }); ts0 = -1; }  // resume: restart the clock
+                    if (stop) break;
+                }
+                DWORD flags = 0;
+                LONGLONG ts = 0;
+                ComPtr<IMFSample> sm;
+                if (FAILED(rd->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, nullptr, &flags, &ts, &sm))) break;
+                if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {  // loop
+                    PROPVARIANT pv{};
+                    pv.vt = VT_I8;
+                    if (FAILED(rd->SetCurrentPosition(GUID_NULL, pv))) break;
+                    ts0 = last = -1;
+                    continue;
+                }
+                if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) if (!readFormat()) break;
+                if (!sm) continue;
+                if (last >= 0 && ts - last < MIN_GAP && ts > last) continue;
+                last = ts;
+                auto now = clock::now();
+                if (ts0 < 0 || now > t0 + std::chrono::microseconds((ts - ts0) / 10) + std::chrono::milliseconds(250)) { t0 = now; ts0 = ts; }  // start, or fell behind
+                {
+                    std::unique_lock l(m);
+                    if (cv.wait_until(l, t0 + std::chrono::microseconds((ts - ts0) / 10), [&] { return stop || paused; }) && stop) break;
+                }
+                ComPtr<IMFMediaBuffer> mb;
+                if (FAILED(sm->ConvertToContiguousBuffer(&mb))) continue;
+                buf.resize((size_t)w * h * 4);
+                ComPtr<IMF2DBuffer> b2;
+                BYTE* scan0 = nullptr;
+                LONG pitch = 0;
+                BYTE* raw = nullptr;
+                DWORD len = 0;
+                bool locked2d = SUCCEEDED(mb.As(&b2)) && SUCCEEDED(b2->Lock2D(&scan0, &pitch));
+                if (!locked2d) {
+                    if (FAILED(mb->Lock(&raw, nullptr, &len))) continue;
+                    pitch = stride;
+                    scan0 = stride < 0 ? raw + (size_t)(h - 1) * (size_t)(-stride) : raw;  // bottom-up rows
+                    if ((size_t)len < (size_t)std::abs(stride) * h) { mb->Unlock(); continue; }
+                }
+                for (UINT y = 0; y < h; y++) memcpy(buf.data() + (size_t)y * w * 4, scan0 + (ptrdiff_t)y * pitch, (size_t)w * 4);
+                if (locked2d) b2->Unlock2D(); else mb->Unlock();
+                {
+                    std::lock_guard l(m);
+                    frame.swap(buf);
+                    fw = w; fh = h;
+                    fresh = true;
+                }
+                if (g_hwnd) PostMessageW(g_hwnd, WM_APP_FRAME, 0, 0);
+            }
+        }
+    }
+    MFShutdown();
+    if (SUCCEEDED(co)) CoUninitialize();
+}
+static VideoBg video;
+
+// ---------------------------------------------------------------------------------------------
 // Direct2D resources and drawing primitives
 // ---------------------------------------------------------------------------------------------
 static ComPtr<ID2D1Factory> d2f;
@@ -1265,7 +1432,8 @@ static ComPtr<IDWriteFactory> dwf;
 static ComPtr<IWICImagingFactory> wic;
 static ComPtr<ID2D1HwndRenderTarget> rt;
 static ComPtr<ID2D1StrokeStyle> roundSt;
-static ComPtr<ID2D1Bitmap> bgFull, bgBlur, bgImageBmp, signatureBmp;
+static ComPtr<ID2D1Bitmap> bgFull, bgBlur, bgImageBmp, signatureBmp, videoBmp;
+static ComPtr<ID2D1BitmapRenderTarget> bgRT[6];  // backdrop at full size, then the blur chain: 1/4, 1/12, 1/24, 1/10, 1/4
 static ComPtr<ID2D1BitmapBrush> blurBrush, sharpBrush;
 static UINT bgW = 0, bgH = 0;
 static bool bgDirty = true;
@@ -1634,11 +1802,11 @@ static void MountainLayer(float w, float h, unsigned seed, float base, float amp
     R->FillGeometry(ridge.Get(), LG(P2(0, minY), P2(0, h), {{0, C(bottom, 0)}, {0.45f, C(bottom, 0.35f)}, {1, C(bottom, 0.96f)}}).Get());
 }
 static void PaintScene(float w, float h) {
-    if (bgImageBmp) {
-        D2D1_SIZE_F s = bgImageBmp->GetSize();
+    if (ID2D1Bitmap* img = video.Active() && videoBmp ? videoBmp.Get() : bgImageBmp.Get()) {  // cover the window, centred
+        D2D1_SIZE_F s = img->GetSize();
         float k = std::max(w / s.width, h / s.height);
         float iw = s.width * k, ih = s.height * k;
-        R->DrawBitmap(bgImageBmp.Get(), RC((w - iw) / 2, (h - ih) / 2, (w + iw) / 2, (h + ih) / 2), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        R->DrawBitmap(img, RC((w - iw) / 2, (h - ih) / 2, (w + iw) / 2, (h + ih) / 2), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         return;
     }
     R->FillRectangle(RC(0, 0, w, h), LG(P2(0, 0), P2(0, h), {{0, C(0x0F1B2E)}, {0.28f, C(0x2A4061)}, {0.48f, C(0x6E7F98)},
@@ -1663,32 +1831,40 @@ static void PaintScene(float w, float h) {
     }
     R->FillRectangle(RC(0, 0, w, h), RG(P2(w / 2, h / 2), w * 0.75f, h * 0.75f, {{0, C(0x050B16, 0)}, {0.7f, C(0x050B16, 0)}, {1, C(0x050B16, 0.5f)}}).Get());
 }
-static ComPtr<ID2D1Bitmap> RenderToBitmap(float w, float h, ID2D1Bitmap* src) {
-    ComPtr<ID2D1BitmapRenderTarget> t;
-    if (FAILED(rt->CreateCompatibleRenderTarget(D2D1::SizeF(w, h), &t))) return {};
+// Draws the scene (src == nullptr) or a scaled copy of `src` into a backdrop target.
+static void RenderInto(ID2D1BitmapRenderTarget* t, ID2D1Bitmap* src) {
+    D2D1_SIZE_F z = t->GetSize();
     t->BeginDraw();
-    if (src) t->DrawBitmap(src, RC(0, 0, w, h), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-    else { ID2D1RenderTarget* old = R; R = t.Get(); PaintScene(w, h); R = old; }
+    if (src) t->DrawBitmap(src, RC(0, 0, z.width, z.height), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    else { ID2D1RenderTarget* old = R; R = t; PaintScene(z.width, z.height); R = old; }
     t->EndDraw();
-    ComPtr<ID2D1Bitmap> b;
-    t->GetBitmap(&b);
-    return b;
 }
+// The backdrop and its frosted copy. The targets are kept between frames, so a video background only
+// redraws into them: the full-size frame, then a progressive downsample whose bilinear upsample is the blur.
 static void EnsureBackground() {
     D2D1_SIZE_U sz = rt->GetPixelSize();
-    if (!bgDirty && bgFull && sz.width == bgW && sz.height == bgH) return;
-    bgDirty = false; bgW = sz.width; bgH = sz.height;
-    float w = (float)std::max(1u, sz.width), h = (float)std::max(1u, sz.height);
-    bgFull = RenderToBitmap(w, h, nullptr);
-    // Cheap high-quality blur: progressive downsample then bilinear upsample.
-    auto q1 = RenderToBitmap(std::max(1.f, floorf(w / 4)), std::max(1.f, floorf(h / 4)), bgFull.Get());
-    auto q2 = q1 ? RenderToBitmap(std::max(1.f, floorf(w / 12)), std::max(1.f, floorf(h / 12)), q1.Get()) : nullptr;
-    auto q3 = q2 ? RenderToBitmap(std::max(1.f, floorf(w / 24)), std::max(1.f, floorf(h / 24)), q2.Get()) : nullptr;
-    auto q4 = q3 ? RenderToBitmap(std::max(1.f, floorf(w / 10)), std::max(1.f, floorf(h / 10)), q3.Get()) : nullptr;
-    bgBlur = q4 ? RenderToBitmap(std::max(1.f, floorf(w / 4)), std::max(1.f, floorf(h / 4)), q4.Get()) : nullptr;
-    blurBrush.Reset(); sharpBrush.Reset();
-    if (bgFull) rt->CreateBitmapBrush(bgFull.Get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR), &sharpBrush);
-    if (bgBlur) rt->CreateBitmapBrush(bgBlur.Get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR), &blurBrush);
+    if (!bgRT[0] || sz.width != bgW || sz.height != bgH) {
+        bgW = sz.width; bgH = sz.height;
+        float w = (float)std::max(1u, sz.width), h = (float)std::max(1u, sz.height);
+        const float div[6] = {1, 4, 12, 24, 10, 4};
+        for (auto& t : bgRT) t.Reset();
+        bgFull.Reset(); bgBlur.Reset(); blurBrush.Reset(); sharpBrush.Reset();
+        for (int i = 0; i < 6; i++)
+            if (FAILED(rt->CreateCompatibleRenderTarget(D2D1::SizeF(std::max(1.f, floorf(w / div[i])), std::max(1.f, floorf(h / div[i]))), &bgRT[i]))) { for (auto& t : bgRT) t.Reset(); return; }
+        bgRT[0]->GetBitmap(&bgFull);
+        bgRT[5]->GetBitmap(&bgBlur);
+        rt->CreateBitmapBrush(bgFull.Get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR), &sharpBrush);
+        rt->CreateBitmapBrush(bgBlur.Get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR), &blurBrush);
+        bgDirty = true;
+    }
+    if (!bgDirty) return;
+    bgDirty = false;
+    RenderInto(bgRT[0].Get(), nullptr);
+    for (int i = 1; i < 6; i++) {
+        ComPtr<ID2D1Bitmap> prev;
+        bgRT[i - 1]->GetBitmap(&prev);
+        RenderInto(bgRT[i].Get(), prev.Get());
+    }
 }
 static ComPtr<IWICFormatConverter> LoadWic(const std::wstring& file) {
     if (!wic || file.empty()) return {};
@@ -1701,10 +1877,20 @@ static ComPtr<IWICFormatConverter> LoadWic(const std::wstring& file) {
     if (!c || FAILED(c->Initialize(f.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeMedianCut))) return {};
     return c;
 }
+static void UpdateFx();
+// Starts or stops the background video to match the settings. Returns why a video cannot be played, or "".
+static std::wstring SyncVideo() {
+    if (!IsVideoFile(cfg.bgImage)) { if (video.Active()) video.Close(); videoBmp.Reset(); return {}; }
+    if (video.Active() && Lower(video.file) == Lower(cfg.bgImage)) return {};
+    videoBmp.Reset();
+    std::wstring why = video.Open(cfg.bgImage);
+    UpdateFx();
+    return why;
+}
 static void LoadImages() {
-    bgImageBmp.Reset(); signatureBmp.Reset();
+    bgImageBmp.Reset(); signatureBmp.Reset(); videoBmp.Reset();
     if (!rt) return;
-    if (auto c = LoadWic(cfg.bgImage)) rt->CreateBitmapFromWicBitmap(c.Get(), &bgImageBmp);
+    if (!IsVideoFile(cfg.bgImage)) if (auto c = LoadWic(cfg.bgImage)) rt->CreateBitmapFromWicBitmap(c.Get(), &bgImageBmp);
     for (auto& dir : {g_exeDir, g_appDir})
         if (!signatureBmp) if (auto c = LoadWic(Join(dir, L"signature.png"))) rt->CreateBitmapFromWicBitmap(c.Get(), &signatureBmp);
     bgDirty = true;
@@ -1889,7 +2075,8 @@ enum Id {
     ID_S_REMEMBER, ID_S_HIDDEN, ID_S_BG_PICK, ID_S_BG_RESET, ID_S_BANNER, ID_S_TINT, ID_S_FROST, ID_S_LOOK_RESET, ID_S_OPENDIR, ID_X_DEFAULTS, ID_X_SAVE, ID_A_DATA,
     ID_CAP_MIN, ID_CAP_MAX, ID_CAP_CLOSE, ID_S_OUTLINE, ID_S_COLA, ID_S_COLB, ID_S_SWAP, ID_S_SPAN, ID_S_OWIDTH, ID_S_OGLOW,
     ID_H_VERIFY, ID_AU_APPLY, ID_AU_VSS, ID_AU_SUMS, ID_AU_VERIFY, ID_AU_COPY, ID_CHK_FIRE, ID_BROWSE_FIRE, ID_VIEW_PRIMARY, ID_VIEW_FIRE,
-    ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_CARD = 1000, ID_LIST = 3000
+    ID_S_GLOWANIM, ID_S_GSPEED,
+    ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_S_FX = 940, ID_CARD = 1000, ID_LIST = 3000
 };
 enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL, IDC_TIME, IDC_KEEP, IDC_DAYS, IDC_FIRE };
 static int page = PG_BACKUP, hoverId = 0, pressId = 0, dragId = 0;
@@ -1927,6 +2114,10 @@ static std::wstring EditText(HWND e) {
     GetWindowTextW(e, b.data(), (int)b.size());
     return b.data();
 }
+enum { FX_PULSE = 1, FX_FLOW = 2, FX_SHIMMER = 4, FX_DRIFT = 8 };
+static const std::chrono::steady_clock::time_point g_fx0 = std::chrono::steady_clock::now();
+static double FxSeconds() { return std::chrono::duration<double>(std::chrono::steady_clock::now() - g_fx0).count(); }
+static D2D1_COLOR_F Mix(D2D1_COLOR_F x, D2D1_COLOR_F y, float k) { return D2D1::ColorF(x.r + (y.r - x.r) * k, x.g + (y.g - x.g) * k, x.b + (y.b - x.b) * k, x.a + (y.a - x.a) * k); }
 static void Glass(D2D1_RECT_F r, float rad, bool gold) {
     for (int i = 1; i <= 5; i++) {
         float e = i * 2.4f;
@@ -1943,26 +2134,52 @@ static void Glass(D2D1_RECT_F r, float rad, bool gold) {
         // Gradient geometry: either this section's box or the whole window, so one gradient flows across all sections.
         D2D1_RECT_F b = cfg.outSpan ? RC(0, -pageDy, DW, DH - pageDy) : r;
         D2D1_COLOR_F a = C(cfg.outA), z = C(cfg.outB);
-        ComPtr<ID2D1Brush> br;
+        // Animated glow: slow, calm effects (the work matters more than the show). Periods are 4.5 to 12 s at
+        // the default speed; the Speed slider scales them between 0.25x and 2x.
+        int fx = cfg.glowAnim ? cfg.glowFx : 0;
+        float T = (float)FxSeconds() * (0.25f + cfg.glowSpeed / 100.f * 1.75f);
+        auto wave = [&](float period) { return 0.5f - 0.5f * cosf(T * 2 * PI / period); };  // 0..1, starts at 0
+        if (fx & FX_DRIFT) { float k = wave(12); D2D1_COLOR_F a0 = a; a = Mix(a, z, k); z = Mix(z, a0, k); }
+        float pulse = fx & FX_PULSE ? 1 - 0.65f * wave(4.5f) : 1.f;
+        float rot = fx & FX_FLOW ? fmodf(T * 2 * PI / 10, 2 * PI) : 0.f;
         float mx = (b.left + b.right) / 2, my = (b.top + b.bottom) / 2;
+        auto turn = [&](D2D1_POINT_2F q) {  // Flow: the gradient axis turns slowly around the box centre
+            float dx = q.x - mx, dy = q.y - my, c = cosf(rot), sn = sinf(rot);
+            return P2(mx + dx * c - dy * sn, my + dx * sn + dy * c);
+        };
+        ComPtr<ID2D1Brush> br;
         switch (cfg.outStyle) {
-        case 0: br = LG(P2(b.left, my), P2(b.right, my), {{0, a}, {1, z}}); break;                       // horizontal
-        case 1: br = LG(P2(mx, b.top), P2(mx, b.bottom), {{0, a}, {1, z}}); break;                       // vertical
-        case 2: br = LG(P2(b.left, b.top), P2(b.right, b.bottom), {{0, a}, {1, z}}); break;              // diagonal
-        case 3: br = LG(P2(b.left, b.bottom), P2(b.right, b.top), {{0, a}, {1, z}}); break;              // reverse diagonal
-        case 4: br = LG(P2(b.left, b.top), P2(b.right, b.bottom), {{0, a}, {0.5f, z}, {1, a}}); break;   // mirror A-B-A
-        default: {                                                                                       // radial glow from centre
+        case 0: br = LG(turn(P2(b.left, my)), turn(P2(b.right, my)), {{0, a}, {1, z}}); break;                         // horizontal
+        case 1: br = LG(turn(P2(mx, b.top)), turn(P2(mx, b.bottom)), {{0, a}, {1, z}}); break;                         // vertical
+        case 2: br = LG(turn(P2(b.left, b.top)), turn(P2(b.right, b.bottom)), {{0, a}, {1, z}}); break;                // diagonal
+        case 3: br = LG(turn(P2(b.left, b.bottom)), turn(P2(b.right, b.top)), {{0, a}, {1, z}}); break;                // reverse diagonal
+        case 4: br = LG(turn(P2(b.left, b.top)), turn(P2(b.right, b.bottom)), {{0, a}, {0.5f, z}, {1, a}}); break;     // mirror A-B-A
+        default: {                                                                                                     // radial glow from centre
             float rr = sqrtf((b.right - b.left) * (b.right - b.left) + (b.bottom - b.top) * (b.bottom - b.top)) / 2;
-            br = RG(P2(mx, my), rr, rr, {{0, a}, {0.55f, a}, {1, z}});
+            float off = fx & FX_FLOW ? std::min(b.right - b.left, b.bottom - b.top) * 0.25f : 0.f;  // Flow: the centre circles
+            br = RG(P2(mx + off * cosf(rot), my + off * sinf(rot)), rr, rr, {{0, a}, {0.55f, a}, {1, z}});
         }
         }
         if (glow > 0)
             for (int i = 3; i >= 1; i--) {
-                br->SetOpacity(0.10f * glow * (4 - i) / 3.f);
-                StrokeRR(r, rad, br.Get(), w + glow * 5.f * i);
+                br->SetOpacity(0.10f * glow * pulse * (4 - i) / 3.f);
+                StrokeRR(r, rad, br.Get(), w + glow * pulse * 5.f * i);
             }
-        br->SetOpacity(1.f);
+        br->SetOpacity(glow > 0 ? 1.f : 0.6f + 0.4f * pulse);
         StrokeRR(r, rad, br.Get(), w);
+        if (fx & FX_SHIMMER) {  // a soft light travels slowly around each section's border
+            float pw = r.right - r.left, ph = r.bottom - r.top, per = 2 * (pw + ph);
+            float u = fmodf(T / 9.f + (r.left + r.top) / (DW + DH) * 0.5f, 1.f) * per;
+            D2D1_POINT_2F q = u < pw ? P2(r.left + u, r.top) : u < pw + ph ? P2(r.right, r.top + u - pw)
+                            : u < 2 * pw + ph ? P2(r.right - (u - pw - ph), r.bottom) : P2(r.left, r.bottom - (u - 2 * pw - ph));
+            D2D1_COLOR_F hi = Mix(Mix(a, z, 0.5f), C(0xFFFFFF), 0.55f), hz = hi;
+            hz.a = 0;
+            auto sh = RG(q, 110, 110, {{0, hi}, {1, hz}});
+            sh->SetOpacity(0.35f + 0.4f * glow);
+            StrokeRR(r, rad, sh.Get(), w + 2.5f + glow * 6.f);
+            sh->SetOpacity(0.9f);
+            StrokeRR(r, rad, sh.Get(), w + 0.6f);
+        }
     } else if (gold) {
         StrokeRR(r, rad, SB(C(0xF2CF7A, 0.10f)).Get(), 6);
         StrokeRR(r, rad, LG(P2(r.left, r.top), P2(r.right, r.bottom), {{0, C(0xF8DE98, 0.95f)}, {0.5f, C(0xD6B05A, 0.50f)}, {1, C(0xF0CC78, 0.85f)}}).Get(), 1.5f);
@@ -2330,42 +2547,52 @@ static void DrawAutomationPage() {
 }
 static void DrawSettingsPage() {
     Glass(PagePanel(), 22, false);
-    Text(L"General", RC(360, 156, 800, 186), 18, C(0xEBC56C), SEMI);
-    if (!flash.empty()) Text(flash, RC(620, 156, 1088, 186), 14, C(0xEBC56C), REG, RIGHT);
-    Check(ID_S_REMEMBER, 362, 200, L"Remember last used folders", cfg.remember, true, 16);
-    Check(ID_S_HIDDEN, 362, 232, L"Skip hidden and system files when backing up  (the versions folder is always skipped)", cfg.skipHidden, true, 16);
-    Line(360, 254, 1088, 254, C(0xAACBEA, 0.15f), 1);
+    D2D1_COLOR_F gold = C(0xEBC56C), sep = C(0xAACBEA, 0.15f);
+    Text(L"General", RC(360, 152, 800, 182), 18, gold, SEMI);
+    if (!flash.empty()) Text(flash, RC(620, 152, 1088, 182), 14, gold, REG, RIGHT);
+    Check(ID_S_REMEMBER, 362, 194, L"Remember last used folders", cfg.remember, true, 16);
+    Check(ID_S_HIDDEN, 362, 224, L"Skip hidden and system files when backing up  (the versions folder is always skipped)", cfg.skipHidden, true, 16);
+    Line(360, 244, 1088, 244, sep, 1);
 
-    Text(L"Appearance", RC(360, 264, 800, 294), 18, C(0xEBC56C), SEMI);
-    Slider(ID_S_TINT, 520, 310, 380, L"Glass tint", cfg.tint);
-    Slider(ID_S_FROST, 520, 344, 380, L"Frost (blur)", cfg.frost);
-    Check(ID_S_BANNER, 362, 378, L"Show page header banner  (alternate layout for A/B testing)", cfg.banner, true, 16);
-    Text(L"Background", RC(362, 398, 520, 420), 15, C(0x93A7BD));
-    Text(cfg.bgImage.empty() ? L"Built-in mountain dusk" : cfg.bgImage, RC(520, 398, 1088, 420), 15, C(0xE8EEF5));
-    Button(ID_S_BG_PICK, RC(360, 426, 560, 464), L"Choose Image...", BS_SECOND, IC_FOLDER, false, true, 15);
-    Button(ID_S_BG_RESET, RC(572, 426, 800, 464), L"Use Built-in Scene", BS_GHOST, IC_NONE, false, !cfg.bgImage.empty(), 15);
-    Button(ID_S_LOOK_RESET, RC(812, 426, 1088, 464), L"Reset Glass Look", BS_GHOST, IC_RESTORE, false, cfg.tint != 55 || cfg.frost != 100, 15);
-    Line(360, 478, 1088, 478, C(0xAACBEA, 0.15f), 1);
+    Text(L"Appearance", RC(360, 250, 800, 280), 18, gold, SEMI);
+    Slider(ID_S_TINT, 520, 294, 380, L"Glass tint", cfg.tint);
+    Slider(ID_S_FROST, 520, 324, 380, L"Frost (blur)", cfg.frost);
+    Check(ID_S_BANNER, 362, 354, L"Show page header banner  (alternate layout for A/B testing)", cfg.banner, true, 16);
+    Text(L"Background", RC(362, 372, 520, 394), 15, C(0x93A7BD));
+    std::wstring bgName = cfg.bgImage.empty() ? L"Built-in mountain dusk"
+                        : cfg.bgImage.substr(cfg.bgImage.find_last_of(L"\\/") + 1) + (!IsVideoFile(cfg.bgImage) ? L""
+                           : video.Active() ? L"   \u00B7  video, looping and muted" : L"   \u00B7  cannot be played, showing the built-in scene");
+    Text(bgName, RC(520, 372, 1088, 394), 15, C(0xE8EEF5));
+    Button(ID_S_BG_PICK, RC(360, 398, 588, 434), L"Choose Image or Video...", BS_SECOND, IC_FOLDER, false, true, 15);
+    Button(ID_S_BG_RESET, RC(600, 398, 812, 434), L"Use Built-in Scene", BS_GHOST, IC_NONE, false, !cfg.bgImage.empty(), 15);
+    Button(ID_S_LOOK_RESET, RC(824, 398, 1088, 434), L"Reset Glass Look", BS_GHOST, IC_RESTORE, false, cfg.tint != 55 || cfg.frost != 100, 15);
+    Line(360, 446, 1088, 446, sep, 1);
 
-    Text(L"Section Outline", RC(360, 488, 800, 518), 18, C(0xEBC56C), SEMI);
-    Check(ID_S_OUTLINE, 362, 534, L"Outline all sections with a two-colour gradient", cfg.outline, true, 16);
+    Text(L"Section Outline", RC(360, 452, 800, 482), 18, gold, SEMI);
+    Check(ID_S_OUTLINE, 362, 496, L"Outline all sections with a two-colour gradient", cfg.outline, true, 16);
     bool en = cfg.outline;
     D2D1_COLOR_F lc = C(0xDCE4EE, en ? 1.f : 0.4f);
-    Text(L"Colours", RC(362, 556, 520, 584), 15, lc);
-    Swatch(ID_S_COLA, 520, 570, cfg.outA, en);
-    Button(ID_S_SWAP, RC(592, 556, 652, 584), L"\u21C4", BS_GHOST, IC_NONE, false, en, 16);
-    Swatch(ID_S_COLB, 662, 570, cfg.outB, en);
-    auto prev = RC(744, 558, 900, 582);  // live preview of the gradient
+    Text(L"Colours", RC(362, 516, 520, 544), 15, lc);
+    Swatch(ID_S_COLA, 520, 530, cfg.outA, en);
+    Button(ID_S_SWAP, RC(592, 516, 652, 544), L"\u21C4", BS_GHOST, IC_NONE, false, en, 16);
+    Swatch(ID_S_COLB, 662, 530, cfg.outB, en);
+    auto prev = RC(744, 518, 900, 542);  // live preview of the gradient
     FillRR(prev, 12, LG(P2(prev.left, 0), P2(prev.right, 0), cfg.outStyle == 4 ? std::initializer_list<D2D1_GRADIENT_STOP>{{0, C(cfg.outA)}, {0.5f, C(cfg.outB)}, {1, C(cfg.outA)}}
                                                                                 : std::initializer_list<D2D1_GRADIENT_STOP>{{0, C(cfg.outA)}, {1, C(cfg.outB)}}).Get());
     if (!en) FillRR(prev, 12, SB(C(0x0C1A2E, 0.6f)).Get());
-    Check(ID_S_SPAN, 920, 570, L"Flow across window", cfg.outSpan, en, 14);
-    Text(L"Gradient", RC(362, 592, 520, 620), 15, lc);
+    Check(ID_S_SPAN, 920, 530, L"Flow across window", cfg.outSpan, en, 14);
+    Text(L"Gradient", RC(362, 552, 520, 580), 15, lc);
     static const wchar_t* styles[6] = {L"Horizontal", L"Vertical", L"Diagonal", L"Reverse", L"Mirror", L"Radial"};
-    for (int i = 0; i < 6; i++) Chip(ID_S_STYLE + i, RC(520 + i * 95.f, 592, 609 + i * 95.f, 622), styles[i], cfg.outStyle == i, en);
-    Slider(ID_S_OWIDTH, 520, 650, 380, L"Thickness", cfg.outWidth, en);
-    Slider(ID_S_OGLOW, 520, 684, 380, L"Glow", cfg.outGlow, en);
-    Text(L"Settings, excludes and the runtime log live in the data folder (About page).", RC(362, 708, 1088, 732), 13, C(0x9CB0C5));
+    for (int i = 0; i < 6; i++) Chip(ID_S_STYLE + i, RC(520 + i * 95.f, 552, 609 + i * 95.f, 580), styles[i], cfg.outStyle == i, en);
+    Slider(ID_S_OWIDTH, 520, 604, 380, L"Thickness", cfg.outWidth, en);
+    Slider(ID_S_OGLOW, 520, 634, 380, L"Glow", cfg.outGlow, en);
+    // Animated glow: any mix of calm effects, plus their speed
+    bool an = en && cfg.glowAnim;
+    Check(ID_S_GLOWANIM, 362, 668, L"Animate", cfg.glowAnim, en, 15);
+    static const wchar_t* fxNames[4] = {L"Pulse", L"Flow", L"Shimmer", L"Drift"};
+    for (int i = 0; i < 4; i++) Chip(ID_S_FX + i, RC(520 + i * 95.f, 654, 609 + i * 95.f, 682), fxNames[i], (cfg.glowFx >> i) & 1, an);
+    Text(an ? L"Calm effects; pick any mix." : L"", RC(904, 654, 1088, 682), 12.5f, C(0x9CB0C5));
+    Slider(ID_S_GSPEED, 520, 708, 380, L"Speed", cfg.glowSpeed, an);
 }
 static void DrawExcludesPage() {
     Glass(PagePanel(), 22, false);
@@ -2565,6 +2792,7 @@ static bool CreateRT() {
     if (FAILED(hr) || !rt) { LogRuntime(L"CreateHwndRenderTarget failed", hr); return false; }
     rt->SetDpi(96, 96);
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+    for (auto& t : bgRT) t.Reset();
     bgFull.Reset(); bgBlur.Reset(); blurBrush.Reset(); sharpBrush.Reset();
     LoadImages();
     return true;
@@ -2614,7 +2842,11 @@ static void Paint() {
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
     DrawCaption(z.width);
     HRESULT hr = rt->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) { LogRuntime(L"EndDraw: recreate target", hr); rt.Reset(); bgFull.Reset(); bgBlur.Reset(); blurBrush.Reset(); sharpBrush.Reset(); bgImageBmp.Reset(); signatureBmp.Reset(); }
+    if (hr == D2DERR_RECREATE_TARGET) {
+        LogRuntime(L"EndDraw: recreate target", hr);
+        for (auto& t : bgRT) t.Reset();
+        rt.Reset(); bgFull.Reset(); bgBlur.Reset(); blurBrush.Reset(); sharpBrush.Reset(); bgImageBmp.Reset(); signatureBmp.Reset(); videoBmp.Reset();
+    }
     else if (FAILED(hr)) LogRuntime(L"EndDraw failed", hr);
 }
 
@@ -2716,8 +2948,9 @@ static std::wstring PickFolder(HWND h, const std::wstring& start) {
 static std::wstring PickImage(HWND h) {
     ComPtr<IFileDialog> d;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&d)))) return {};
-    COMDLG_FILTERSPEC f[] = {{L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.tif;*.tiff"}, {L"All files", L"*.*"}};
-    d->SetFileTypes(2, f);
+    COMDLG_FILTERSPEC f[] = {{L"Images and videos", L"*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.tif;*.tiff;*.mp4;*.m4v;*.mov;*.wmv;*.avi;*.mkv"},
+                             {L"Images", L"*.jpg;*.jpeg;*.png;*.bmp;*.webp;*.tif;*.tiff"}, {L"Videos (looping, muted)", L"*.mp4;*.m4v;*.mov;*.wmv;*.avi;*.mkv"}, {L"All files", L"*.*"}};
+    d->SetFileTypes(4, f);
     if (FAILED(d->Show(h))) return {};
     ComPtr<IShellItem> i;
     if (FAILED(d->GetResult(&i))) return {};
@@ -2726,6 +2959,15 @@ static std::wstring PickImage(HWND h) {
     std::wstring s = p ? p : L"";
     CoTaskMemFree(p);
     return s;
+}
+// Runs the effect timer only while the animated glow is visible, and pauses the video background while the
+// window is minimized or a backup, restore or verification is reading and writing the disks.
+static void UpdateFx() {
+    if (!g_hwnd) return;
+    bool shown = !IsIconic(g_hwnd);
+    if (cfg.outline && cfg.glowAnim && shown) SetTimer(g_hwnd, T_FX, 33, nullptr);
+    else KillTimer(g_hwnd, T_FX);
+    if (video.Active()) video.Pause(!shown || Running());
 }
 static void OpenFolder(const std::wstring& p) { ShellExecuteW(g_hwnd, L"open", p.c_str(), nullptr, nullptr, SW_SHOWNORMAL); }
 static void Notify(const std::wstring& m) {
@@ -2749,6 +2991,7 @@ static void ResetJob(int kind, const std::wstring& title) {
     }
     job.phase = 1;
     if (g_hwnd) SetTimer(g_hwnd, T_ANIM, 50, nullptr);
+    UpdateFx();
 }
 static void StartBackup() {
     ReadEdits();
@@ -2820,7 +3063,8 @@ static void DragSlider(float x) {
         if (hs.id == dragId) {
             float l = hs.px.left + 10 * gs, r = hs.px.right - 10 * gs;
             int v = std::clamp((int)lroundf((x - l) / std::max(1.f, r - l) * 100), 0, 100);
-            int* target = dragId == ID_S_TINT ? &cfg.tint : dragId == ID_S_FROST ? &cfg.frost : dragId == ID_S_OWIDTH ? &cfg.outWidth : &cfg.outGlow;
+            int* target = dragId == ID_S_TINT ? &cfg.tint : dragId == ID_S_FROST ? &cfg.frost : dragId == ID_S_OWIDTH ? &cfg.outWidth
+                        : dragId == ID_S_GSPEED ? &cfg.glowSpeed : &cfg.outGlow;
             *target = v;
             InvalidateRect(g_hwnd, nullptr, FALSE);
             return;
@@ -2838,6 +3082,12 @@ static void PickColour(UINT32& col) {
 }
 static void OnClick(int id) {
     if (id >= ID_S_STYLE && id < ID_S_STYLE + 6) { cfg.outStyle = id - ID_S_STYLE; SaveSettings(); InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    if (id >= ID_S_FX && id < ID_S_FX + 4) {  // effects combine; at least one stays on
+        int v = cfg.glowFx ^ (1 << (id - ID_S_FX));
+        if (v) { cfg.glowFx = v; SaveSettings(); }
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
+    }
     if (id >= ID_AU_FREQ && id < ID_AU_FREQ + 4) { cfg.schedMode = id - ID_AU_FREQ; ShowControls(); InvalidateRect(g_hwnd, nullptr, FALSE); return; }
     if (id >= ID_AU_DAY && id < ID_AU_DAY + 7) { cfg.schedDay = id - ID_AU_DAY; InvalidateRect(g_hwnd, nullptr, FALSE); return; }
     if (id >= ID_NAV && id < ID_NAV + (int)PG_COUNT) { GoPage(id - ID_NAV); return; }
@@ -2912,18 +3162,27 @@ static void OnClick(int id) {
     case ID_S_BG_PICK: {
         auto f = PickImage(g_hwnd);
         if (f.empty()) break;
+        if (IsVideoFile(f)) {
+            std::wstring old = cfg.bgImage;
+            cfg.bgImage = f;
+            std::wstring why = SyncVideo();
+            if (!why.empty()) { cfg.bgImage = old; SyncVideo(); LoadImages(); flash = why; break; }
+            SaveSettings(); LoadImages(); flash = L"Video background playing.";
+            break;
+        }
         if (!LoadWic(f)) { flash = L"That image could not be read."; break; }
-        cfg.bgImage = f; SaveSettings(); LoadImages(); flash = L"Background updated.";
+        cfg.bgImage = f; SaveSettings(); SyncVideo(); LoadImages(); flash = L"Background updated.";
         break;
     }
     case ID_S_BANNER: cfg.banner = !cfg.banner; SaveSettings(); LayoutControls(); break;
-    case ID_S_OUTLINE: cfg.outline = !cfg.outline; SaveSettings(); break;
+    case ID_S_OUTLINE: cfg.outline = !cfg.outline; SaveSettings(); UpdateFx(); break;
+    case ID_S_GLOWANIM: cfg.glowAnim = !cfg.glowAnim; SaveSettings(); UpdateFx(); break;
     case ID_S_SPAN: cfg.outSpan = !cfg.outSpan; SaveSettings(); break;
     case ID_S_COLA: PickColour(cfg.outA); SaveSettings(); break;
     case ID_S_COLB: PickColour(cfg.outB); SaveSettings(); break;
     case ID_S_SWAP: std::swap(cfg.outA, cfg.outB); SaveSettings(); break;
     case ID_S_LOOK_RESET: cfg.tint = 55; cfg.frost = 100; SaveSettings(); break;
-    case ID_S_BG_RESET: cfg.bgImage.clear(); SaveSettings(); LoadImages(); flash = L"Built-in scene restored."; break;
+    case ID_S_BG_RESET: cfg.bgImage.clear(); SaveSettings(); SyncVideo(); LoadImages(); flash = L"Built-in scene restored."; break;
     case ID_S_OPENDIR: case ID_A_DATA: OpenFolder(g_appDir); break;
     case ID_X_DEFAULTS: SetWindowTextW(editExcl, DEFAULT_EXCLUDES); flash = L"Defaults loaded \u2014 press Save to keep them."; break;
     case ID_X_SAVE: cfg.excludes = EditText(editExcl); SaveSettings(); flash = L"Excludes saved."; break;
@@ -3163,6 +3422,8 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         CheckFirebox();
         RefreshHistory();
         LayoutControls();
+        if (!SyncVideo().empty()) LogRuntime(L"Background video could not be played");
+        UpdateFx();
         return 0;
     }
     case WM_NCCALCSIZE:
@@ -3214,6 +3475,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_SIZE:
+        UpdateFx();
         if (w == SIZE_MINIMIZED) return 0;
         if (rt) rt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
         bgDirty = true;
@@ -3253,6 +3515,18 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_APP_FRAME: {  // a new video frame: upload it and re-blur the glass
+        static std::vector<BYTE> px;
+        UINT fw = 0, fh = 0;
+        if (rt && video.Take(px, fw, fh) && px.size() >= (size_t)fw * fh * 4) {
+            if (!videoBmp || videoBmp->GetPixelSize().width != fw || videoBmp->GetPixelSize().height != fh) {
+                videoBmp.Reset();
+                rt->CreateBitmap(D2D1::SizeU(fw, fh), D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE)), &videoBmp);
+            }
+            if (videoBmp && SUCCEEDED(videoBmp->CopyFromMemory(nullptr, px.data(), fw * 4))) { bgDirty = true; InvalidateRect(h, nullptr, FALSE); }
+        }
+        return 0;
+    }
     case WM_TIMER:
         if (w == T_HIST) { KillTimer(h, T_HIST); ReadEdits(); CheckFirebox(); RefreshHistory(); }
         InvalidateRect(h, nullptr, FALSE);
@@ -3260,6 +3534,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_APP_JOBDONE: {
         if (worker.joinable()) worker.join();
         KillTimer(h, T_ANIM);
+        UpdateFx();
         std::wstring dir;
         { std::lock_guard lk(job.m); dir = job.resultDir; }
         RefreshHistory();
@@ -3294,7 +3569,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFocus(h);
         pressId = HitId((float)GET_X_LPARAM(l), (float)GET_Y_LPARAM(l));
         if (pressId) SetCapture(h);
-        if (pressId == ID_S_TINT || pressId == ID_S_FROST || pressId == ID_S_OWIDTH || pressId == ID_S_OGLOW) { dragId = pressId; DragSlider((float)GET_X_LPARAM(l)); }
+        if (pressId == ID_S_TINT || pressId == ID_S_FROST || pressId == ID_S_OWIDTH || pressId == ID_S_OGLOW || pressId == ID_S_GSPEED) { dragId = pressId; DragSlider((float)GET_X_LPARAM(l)); }
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_LBUTTONUP: {
@@ -3329,6 +3604,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_DESTROY:
         if (worker.joinable()) { job.cancel = true; worker.join(); }
+        video.Close();
         PostQuitMessage(0);
         return 0;
     }

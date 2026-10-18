@@ -45,13 +45,14 @@ Entropy Backup is a simple yet effective native app for incremental, versioned p
 - **Excludes** keep things like `node_modules`, `.vs` and `*.obj` out of snapshots. Wildcards, path patterns and `#` comments are supported.
 
 **Make it yours**
-- Custom **background image**, or the built-in rendered mountain dusk.
+- Custom **background image or looping video** (`.mp4`, `.mov`, `.wmv`, ...), or the built-in rendered mountain dusk. A video plays muted, the frosted glass blurs it live, and it pauses while minimized or during a backup.
 - **Glass tint** and **Frost (blur)** sliders that update live.
 - **Section Outline**: a two-colour gradient around every section.
   - Colour pickers and a swap button.
   - Horizontal, Vertical, Diagonal, Reverse, Mirror and Radial styles.
   - Optional single gradient that flows across the whole window.
   - Thickness and glow sliders.
+  - **Animated glow**: calm effects you can combine (**Pulse**, **Flow**, **Shimmer**, **Drift**) with a speed slider.
 - Optional **page header banner** layout, frameless window, per-monitor DPI, and a layout that scales with the window.
 
 | History | Settings |

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.8.0
+**Living glass:** an animated outline glow and video backgrounds (Windows app).
+- **Animated glow** (Settings › Section Outline › **Animate**): calm effects that you can combine, plus a **Speed** slider. They are kept slow on purpose, so they never pull attention from a backup.
+  - **Pulse**: the glow slowly breathes in and out.
+  - **Flow**: the gradient slowly turns around each section, or across the whole window with *Flow across window*.
+  - **Shimmer**: a soft light travels around each section's border.
+  - **Drift**: the two outline colours slowly trade places.
+  - The animation runs only while the outline is on and the window is not minimized.
+- **Video backgrounds:** **Choose Image or Video...** now also accepts `.mp4`, `.m4v`, `.mov`, `.wmv`, `.avi` and `.mkv`, decoded by Windows' own Media Foundation with nothing extra to install. The video loops, plays muted, fills the window, and the frosted glass blurs the live picture.
+  - Light on resources: at most 30 fps, decoded on a background thread, and the blur targets are reused between frames. A 480p clip uses about 2% CPU.
+  - The video pauses while the window is minimized and while a backup, restore or verification is running, so it never competes with the disks.
+  - A video that cannot be played is reported, and the current background is kept. If one fails when the app starts, the built-in scene is shown and Settings says so.
+- The Settings page is laid out more tightly to make room for the new controls. The data-folder note it used to show is still on the About page.
+- The built-in mountain dusk remains the default background.
+
 ## 1.7.0
 **Firebox mode: no single point of failure.** Even a RAID NAS is one machine in one place, so a single backup folder can still lose everything. Firebox mode backs up to a second location as well, named after the fireproof boxes that backups were once kept in, off site, in case of fire.
 - **Backup page:** a **Firebox mode** switch next to *To*. Turning it on adds a **Firebox** folder row with a flame icon. The app warns when the Firebox is on the same drive as the backup folder, and refuses a Firebox that is the backup folder itself or sits inside the other destination's versions folder.
