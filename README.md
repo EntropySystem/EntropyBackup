@@ -2,7 +2,7 @@
 
 **When Entropy is back UP, launch EntropyBackup!....exe** 🙃
 
-Entropy Backup is a simple yet effective native Windows 11 app for incremental, versioned project backups, with a modern frosted-glass UI.
+Entropy Backup is a simple yet effective native app for incremental, versioned project backups on **Windows 11** and **macOS**, with a modern frosted-glass UI.
 
 ![Entropy Backup — backup page](docs/screenshots/backup.png)
 
@@ -49,9 +49,29 @@ Entropy Backup is a simple yet effective native Windows 11 app for incremental, 
 
 ## Download
 
-Grab `EntropyBackup.exe` (and `EntropyBackupCLI.exe` for scripts) from the [latest release](https://github.com/EntropySystem/EntropyBackup/releases/latest). No installer is needed. Requires Windows 10/11 x64.
+From the [latest release](https://github.com/EntropySystem/EntropyBackup/releases/latest):
 
-The executable is not code-signed, so Windows SmartScreen may show a warning. You can also build it yourself from source (below).
+- **Windows 10/11 x64:** `EntropyBackup.exe` (and `EntropyBackupCLI.exe` for scripts). No installer is needed.
+- **macOS 14 or later** (including macOS 27, Apple silicon and Intel): `EntropyBackup-macOS.zip`. Unzip it and move *Entropy Backup* to Applications. See [macOS](#macos).
+
+The builds are not code-signed, so Windows SmartScreen may show a warning, and macOS asks you to allow the app once in System Settings › Privacy & Security › **Open Anyway**. You can also build from source (below). Every push is built and tested on GitHub Actions; the downloads of any run are under its *Artifacts*.
+
+## macOS
+
+The macOS app (in [`macos/`](macos)) is a native Swift/SwiftUI app with the same features and the same snapshot format, so a backup folder can be browsed by either app. It uses Liquid Glass on macOS 26 and later.
+
+- **Copies** are APFS clones where possible (instant, no extra space on the same volume), and permissions, extended attributes and dates are preserved.
+- **Scheduled backups** are a per-user launchd agent (`~/Library/LaunchAgents/com.entropysystem.entropybackup.scheduled.plist`). A run missed while the Mac slept starts when it wakes.
+- **Full Disk Access:** to back up Documents, Desktop or external drives from a scheduled run, add *Entropy Backup* in System Settings › Privacy & Security › Full Disk Access (the Automation page has a button). Re-add it after installing a new build.
+- **Open files:** macOS does not lock open files, so they are read as they are. Volume Shadow Copy is Windows-only.
+- **Command line:** the app's executable takes the same commands as `EntropyBackupCLI.exe` (without `--vss`):
+
+```sh
+alias entropybackup="/Applications/Entropy Backup.app/Contents/MacOS/EntropyBackup"
+entropybackup backup --from ~/Projects/MyApp --to /Volumes/Backup --verify --keep 30
+```
+
+Build it with Xcode 15 or later: `cd macos && swift test && scripts/make-app.sh` (output in `macos/dist/`).
 
 ## Command line
 
@@ -83,7 +103,7 @@ schtasks /Create /TN "Nightly project backup" /SC DAILY /ST 02:00 /RL HIGHEST ^
   /TR "\"C:\Tools\EntropyBackup.exe\" backup --scheduled --from \"C:\Projects\MyApp\" --to \"E:\Backups\" --vss"
 ```
 
-## Build from source
+## Build from source (Windows)
 
 Requirements: Visual Studio 2022 (or Build Tools) with **Desktop development with C++**, a Windows SDK, and CMake 3.24+.
 

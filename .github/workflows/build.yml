@@ -1,0 +1,123 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (MSVC, Release x64)
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Smoke test the command line
+        shell: pwsh
+        run: |
+          $cli = "build\Release\EntropyBackupCLI.exe"
+          function Check($expected) { if ($LASTEXITCODE -ne $expected) { throw "exit code $LASTEXITCODE, expected $expected" } }
+          & $cli help; Check 0
+          New-Item -ItemType Directory t\src\sub, t\dst | Out-Null
+          Set-Content t\src\a.txt "hello"; Set-Content t\src\sub\b.txt "world"
+          & $cli backup --from t\src --to t\dst --verify --desc "CI"; Check 0
+          Add-Content t\src\a.txt "changed"
+          & $cli backup --from t\src --to t\dst --verify; Check 0
+          & $cli list --to t\dst; Check 0
+          # The runner is an administrator, so the shadow copy must really be used: copy a file held open exclusively.
+          $open = [System.IO.File]::Open("$PWD\t\src\sub\b.txt", 'Open', 'ReadWrite', 'None')
+          & $cli backup --from t\src --to t\dst --vss --verify --keep 2; Check 0
+          $open.Close()
+          $snap = Get-ChildItem t\dst\EntropyBackup_Versions -Directory -Filter "snapshot_*" | Sort-Object Name | Select-Object -Last 1
+          if (-not (Select-String -Path "$($snap.FullName)\backup.json" -Pattern '"shadow_copy": true' -Quiet)) { throw "shadow copy was not used" }
+          if ((Get-ChildItem t\dst\EntropyBackup_Versions -Directory -Filter "snapshot_*").Count -ne 2) { throw "retention did not keep 2 snapshots" }
+          Set-Content "$($snap.FullName)\files\a.txt" "corrupted"
+          & $cli verify --to t\dst; Check 1
+          & $cli backup --from t\missing --to t\dst; Check 2
+          & $cli backup --bogus; Check 3
+          Write-Host "All command-line checks passed."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EntropyBackup-windows-x64
+          path: |
+            build/Release/EntropyBackup.exe
+            build/Release/EntropyBackupCLI.exe
+
+  macos:
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - uses: actions/checkout@v4
+      - run: sw_vers && xcodebuild -version && swift --version
+
+      - name: Unit tests
+        run: swift test
+
+      - name: Build the app (universal)
+        run: scripts/make-app.sh
+
+      - name: Smoke test the command line
+        run: |
+          app=dist/EntropyBackup.app/Contents/MacOS/EntropyBackup
+          export ENTROPYBACKUP_HOME="$RUNNER_TEMP/home"
+          t="$RUNNER_TEMP/t"; mkdir -p "$t/src/sub" "$t/dst"
+          echo hello > "$t/src/a.txt"; echo world > "$t/src/sub/b.txt"
+          check() { want=$1; shift; set +e; "$@"; rc=$?; set -e; [ "$rc" -eq "$want" ] || { echo "::error::exit $rc, expected $want: $*"; exit 1; }; }
+          check 0 "$app" help
+          check 0 "$app" backup --from "$t/src" --to "$t/dst" --verify --desc CI
+          sleep 1; echo more >> "$t/src/a.txt"
+          check 0 "$app" backup --from "$t/src" --to "$t/dst" --verify
+          sleep 1; check 0 "$app" backup --from "$t/src" --to "$t/dst" --keep 2
+          check 0 "$app" list --to "$t/dst"
+          [ "$(ls -d "$t"/dst/EntropyBackup_Versions/snapshot_* | wc -l)" -eq 2 ] || { echo "::error::retention did not keep 2 snapshots"; exit 1; }
+          snap=$(ls -d "$t"/dst/EntropyBackup_Versions/snapshot_* | tail -1)
+          echo corrupted > "$snap/files/sub/b.txt"
+          check 1 "$app" verify --to "$t/dst"
+          check 2 "$app" backup --from "$t/missing" --to "$t/dst"
+          check 3 "$app" backup --bogus
+          echo "All command-line checks passed."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EntropyBackup-macOS
+          path: macos/dist/EntropyBackup-macOS.zip
+
+  # On a v* tag: one release with both downloads. The Windows build alone is enough to publish.
+  release:
+    needs: [windows, macos]
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Release notes from CHANGELOG
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v h="## $v" '$0 == h {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
+          [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
+          cat >> notes.md <<'NOTES'
+
+          **Downloads:** `EntropyBackup.exe` (Windows app), `EntropyBackupCLI.exe` (Windows command line) and `EntropyBackup-macOS.zip` (macOS 14 or later, Apple silicon and Intel).
+          The builds are not code-signed. On Windows, SmartScreen may ask you to confirm. On macOS, open the app once, then allow it in System Settings › Privacy & Security › Open Anyway.
+          NOTES
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: Entropy Backup ${{ github.ref_name }}
+          body_path: notes.md
+          files: |
+            artifacts/EntropyBackup-windows-x64/EntropyBackup.exe
+            artifacts/EntropyBackup-windows-x64/EntropyBackupCLI.exe
+            artifacts/EntropyBackup-macOS/EntropyBackup-macOS.zip

@@ -11,6 +11,8 @@ Automation and integrity features for IT pros, on a new **Automation** page.
 - A lock file in the versions folder stops two backups to the same destination from running at once, and interrupted `incomplete_*` folders are cleaned up on the next run.
 - Fix: deleting a snapshot (cancel, mirror refresh, retention) no longer clears the read-only flag on hard-linked files that older snapshots share.
 - New slogan: "When Entropy is back UP, launch EntropyBackup!....exe", shown in the README and on the About page.
+- **New: Entropy Backup for macOS** (macOS 14 or later, including macOS 27; universal). It is a native Swift/SwiftUI app with the same features and snapshot format: incremental hard-linked snapshots with APFS clones, history, restore, excludes, scheduled backups through launchd, retention, SHA-256 checksums and verification, and the same command line and exit codes. It uses Liquid Glass on macOS 26 and later. The About page says "....app".
+- GitHub Actions builds and tests both apps on every push (MSVC on Windows, including a real shadow-copy backup; Swift on macOS) and publishes them on a `v*` tag.
 
 ## 1.5.0
 - New **Section Outline** settings: one switch outlines every section with a two-colour gradient.
