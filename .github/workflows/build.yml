@@ -6,6 +6,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: Publish a release with this tag (e.g. v1.6.0); leave empty to just build
+        required: false
+        default: ''
 
 jobs:
   windows:
@@ -92,10 +97,11 @@ jobs:
           name: EntropyBackup-macOS
           path: macos/dist/EntropyBackup-macOS.zip
 
-  # On a v* tag: one release with both downloads. The Windows build alone is enough to publish.
+  # On a v* tag, or a manual run with a release tag: one release with both downloads.
+  # The Windows build alone is enough to publish.
   release:
     needs: [windows, macos]
-    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.windows.result == 'success'
+    if: always() && (startsWith(github.ref, 'refs/tags/v') || inputs.release != '') && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -105,8 +111,10 @@ jobs:
         with:
           path: artifacts
       - name: Release notes from CHANGELOG
+        env:
+          TAG: ${{ inputs.release || github.ref_name }}
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           awk -v h="## $v" '$0 == h {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "See CHANGELOG.md." > notes.md
           cat >> notes.md <<'NOTES'
@@ -116,7 +124,9 @@ jobs:
           NOTES
       - uses: softprops/action-gh-release@v2
         with:
-          name: Entropy Backup ${{ github.ref_name }}
+          tag_name: ${{ inputs.release || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: Entropy Backup ${{ inputs.release || github.ref_name }}
           body_path: notes.md
           files: |
             artifacts/EntropyBackup-windows-x64/EntropyBackup.exe
