@@ -12,6 +12,12 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <wincodec.h>
+#include <oleauto.h>
+#include <bcrypt.h>
+#include <taskschd.h>
+#include <vss.h>
+#include <vswriter.h>
+#include <vsbackup.h>
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
@@ -30,11 +36,13 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "oleaut32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 using Microsoft::WRL::ComPtr;
 
-static const wchar_t* APP_VERSION = L"1.5.0";
+static const wchar_t* APP_VERSION = L"1.6.0";
 static const wchar_t* CLS = L"EntropyBackupGlassWindow";
 static const float DW = 1480.f, DH = 950.f;   // design canvas, scaled uniformly to the window
 static const float PI = 3.14159265f;
@@ -107,6 +115,29 @@ static bool MakeDirs(const std::wstring& p) {
     }
     return IsDir(p);
 }
+// Deletes one file without clearing its read-only flag for good. Snapshot files are hard links and every
+// link shares one set of attributes, so clearing the flag would also strip it from older snapshots.
+static bool DeleteOne(const std::wstring& p) {
+    if (DeleteFileW(XP(p).c_str())) return true;
+    HANDLE h = CreateFileW(XP(p).c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD ex = 0x1 | 0x2 | 0x10;  // FileDispositionInfoEx: DELETE | POSIX_SEMANTICS | IGNORE_READONLY_ATTRIBUTE (Windows 10 1809+)
+    BOOL ok = SetFileInformationByHandle(h, (FILE_INFO_BY_HANDLE_CLASS)21, &ex, sizeof(ex));
+    FILE_BASIC_INFO bi{};
+    if (!ok && GetFileInformationByHandleEx(h, FileBasicInfo, &bi, sizeof(bi))) {  // older Windows: clear, delete, put the flag back
+        DWORD attrs = bi.FileAttributes;
+        bi.FileAttributes = (attrs & ~FILE_ATTRIBUTE_READONLY) ? attrs & ~FILE_ATTRIBUTE_READONLY : FILE_ATTRIBUTE_NORMAL;
+        FILE_DISPOSITION_INFO di{TRUE};
+        if (SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi))) {
+            ok = SetFileInformationByHandle(h, FileDispositionInfo, &di, sizeof(di));
+            bi.FileAttributes = attrs;
+            SetFileInformationByHandle(h, FileBasicInfo, &bi, sizeof(bi));
+        }
+    }
+    CloseHandle(h);
+    return ok != FALSE;
+}
 static void RemoveTree(const std::wstring& p) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW(XP(Join(p, L"*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
@@ -118,10 +149,7 @@ static void RemoveTree(const std::wstring& p) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) RemoveDirectoryW(XP(c).c_str());
                 else RemoveTree(c);
-            } else if (!DeleteFileW(XP(c).c_str())) {
-                SetFileAttributesW(XP(c).c_str(), FILE_ATTRIBUTE_NORMAL);
-                DeleteFileW(XP(c).c_str());
-            }
+            } else DeleteOne(c);
         } while (FindNextFileW(h, &fd));
         FindClose(h);
     }
@@ -261,6 +289,9 @@ struct Settings {
     bool outline = false, outSpan = false;
     UINT32 outA = 0xF2CF7A, outB = 0x5CCBFF;  // 0xRRGGBB
     int outStyle = 2, outWidth = 30, outGlow = 40;
+    // Automation: schedule (0 off, 1 hourly, 2 daily, 3 weekly; day 0 = Sunday), retention (0 = no limit) and integrity.
+    int schedMode = 2, schedHour = 2, schedMin = 0, schedDay = 1, keepCount = 0, keepDays = 0;
+    bool shadow = false, checksums = false, verifyAfter = false;
 };
 static Settings cfg;
 static std::wstring g_appDir, g_exeDir;
@@ -295,6 +326,15 @@ static void LoadSettings() {
     cfg.outWidth = std::clamp(iniInt(L"OutlineWidth", 30), 0, 100);
     cfg.outGlow = std::clamp(iniInt(L"OutlineGlow", 40), 0, 100);
     cfg.bgImage = IniGet(L"BackgroundImage", L"");
+    cfg.schedMode = std::clamp(iniInt(L"ScheduleMode", 2), 0, 3);
+    cfg.schedHour = std::clamp(iniInt(L"ScheduleHour", 2), 0, 23);
+    cfg.schedMin = std::clamp(iniInt(L"ScheduleMinute", 0), 0, 59);
+    cfg.schedDay = std::clamp(iniInt(L"ScheduleDay", 1), 0, 6);
+    cfg.keepCount = std::clamp(iniInt(L"KeepCount", 0), 0, 99999);
+    cfg.keepDays = std::clamp(iniInt(L"KeepDays", 0), 0, 99999);
+    cfg.shadow = IniBool(L"ShadowCopy", false);
+    cfg.checksums = IniBool(L"Checksums", false);
+    cfg.verifyAfter = IniBool(L"VerifyAfterBackup", false);
     std::string ex;
     if (ReadAll(Join(g_appDir, L"excludes.txt"), ex)) cfg.excludes = W8(ex);
 }
@@ -324,6 +364,15 @@ static void SaveSettings() {
     IniSet(L"OutlineWidth", std::to_wstring(cfg.outWidth));
     IniSet(L"OutlineGlow", std::to_wstring(cfg.outGlow));
     IniSet(L"BackgroundImage", cfg.bgImage);
+    IniSet(L"ScheduleMode", std::to_wstring(cfg.schedMode));
+    IniSet(L"ScheduleHour", std::to_wstring(cfg.schedHour));
+    IniSet(L"ScheduleMinute", std::to_wstring(cfg.schedMin));
+    IniSet(L"ScheduleDay", std::to_wstring(cfg.schedDay));
+    IniSet(L"KeepCount", std::to_wstring(cfg.keepCount));
+    IniSet(L"KeepDays", std::to_wstring(cfg.keepDays));
+    IniSet(L"ShadowCopy", cfg.shadow ? L"1" : L"0");
+    IniSet(L"Checksums", cfg.checksums ? L"1" : L"0");
+    IniSet(L"VerifyAfterBackup", cfg.verifyAfter ? L"1" : L"0");
     WriteAll(Join(g_appDir, L"excludes.txt"), U8(cfg.excludes));
 }
 static std::vector<std::wstring> Patterns(const std::wstring& text) {
@@ -354,6 +403,17 @@ static void LogRuntime(const wchar_t* stage, HRESULT hr = S_OK) {
     HANDLE h = CreateFileW(Join(g_appDir, L"runtime.log").c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
     if (h != INVALID_HANDLE_VALUE) { std::string s = U8(b); DWORD w; WriteFile(h, s.data(), (DWORD)s.size(), &w, nullptr); CloseHandle(h); }
 }
+// backup.log: one line per finished job, so scheduled and scripted runs leave a trail. --log redirects it.
+static std::wstring g_logPath;
+static void LogEvent(const std::wstring& line) {
+    std::wstring path = !g_logPath.empty() ? g_logPath : g_appDir.empty() ? L"" : Join(g_appDir, L"backup.log");
+    if (path.empty()) return;
+    wchar_t b[32];
+    SYSTEMTIME t; GetLocalTime(&t);
+    swprintf_s(b, L"%04d-%02d-%02d %02d:%02d:%02d  ", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    HANDLE h = CreateFileW(XP(path).c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (h != INVALID_HANDLE_VALUE) { std::string s = U8(b + line + L"\r\n"); DWORD w; WriteFile(h, s.data(), (DWORD)s.size(), &w, nullptr); CloseHandle(h); }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Snapshot history
@@ -362,7 +422,9 @@ struct Snap {
     std::wstring dir, id, date, time, desc, source, type, created;
     uint64_t files = 0, copied = 0, reused = 0, bytes = 0, bytesTotal = 0, failed = 0;
     double seconds = 0;
-    bool mirror = false;
+    bool mirror = false, shadow = false, sums = false, verified = false;
+    uint64_t vChecked = 0, vBad = 0;  // last verification: files checked, mismatched or missing
+    std::wstring vWhen;
 };
 static std::vector<Snap> snaps;
 static int selSnap = 0, cardScroll = 0, listScroll = 0;
@@ -397,6 +459,19 @@ static void RefreshHistory() {
         s.bytesTotal = (uint64_t)JNum(z, "bytes_total");
         s.failed = (uint64_t)JNum(z, "failed");
         s.seconds = JNum(z, "duration_seconds");
+        s.shadow = z.find("\"shadow_copy\": true") != std::string::npos;
+        s.sums = z.find("\"checksums\": true") != std::string::npos;
+        std::string v;
+        if (ReadAll(Join(s.dir, L"verify.json"), v)) {
+            s.verified = true;
+            s.vChecked = (uint64_t)JNum(v, "checked");
+            s.vBad = (uint64_t)(JNum(v, "mismatched") + JNum(v, "missing"));
+            std::wstring d, t;
+            std::wstring iso = JStr(v, "verified_iso");
+            for (auto& c : iso) { if (c == L'T') c = L'_'; else if (c == L':') c = L'-'; }
+            FormatId(iso, d, t);
+            s.vWhen = d + L" " + t;
+        }
         if (isSnap) s.id = n.substr(9);
         else {
             std::wstring iso = JStr(z, "created_iso");
@@ -420,10 +495,11 @@ struct JobState {
     std::atomic<int> kind{0};   // 0 backup, 1 restore
     std::atomic<int> phase{0};  // 0 idle, 1 scanning, 2 copying, 3 finalizing, 4 done, 5 failed, 6 cancelled
     std::atomic<uint64_t> scanned{0}, copied{0}, linked{0}, skipped{0}, bytesWritten{0}, workDone{0}, workTotal{0};
+    std::atomic<uint64_t> warnings{0};  // skipped files, checksum problems, shadow copy fallback
     std::atomic<bool> cancel{false};
     std::mutex m;
     std::chrono::steady_clock::time_point t0, t1;
-    std::wstring current, message = IDLE_MESSAGE, resultDir;
+    std::wstring current, message = IDLE_MESSAGE, resultDir, title;
 };
 static JobState job;
 static std::thread worker;
@@ -431,7 +507,7 @@ static HWND g_hwnd{};
 static bool Running() { int p = job.phase; return p >= 1 && p <= 3; }
 static void SetCurrent(const std::wstring& s) { std::lock_guard l(job.m); job.current = s; }
 
-struct FileItem { std::wstring rel; uint64_t size, mtime, ctime; bool link = false, failed = false; };
+struct FileItem { std::wstring rel; uint64_t size, mtime, ctime; bool link = false, failed = false; std::string sha; };
 struct DirItem { std::wstring rel; FILETIME c, a, w; };
 struct ScanOpts { std::vector<std::wstring> patterns; bool skipHidden = false; std::wstring skipDir; };
 struct Fail { std::wstring msg; };
@@ -486,7 +562,9 @@ static DWORD CALLBACK CopyProgress(LARGE_INTEGER, LARGE_INTEGER done, LARGE_INTE
     job.workDone = ((CopyCtx*)ctx)->base + (uint64_t)done.QuadPart;
     return job.cancel ? PROGRESS_CANCEL : PROGRESS_CONTINUE;
 }
-static bool LoadManifest(const std::wstring& path, std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>>& m) {
+// manifest.tsv lines are size<TAB>mtime<TAB>path (v1) or size<TAB>mtime<TAB>sha256<TAB>path (v2, "-" = no checksum).
+struct ManEntry { std::wstring rel; uint64_t size = 0, mtime = 0; std::string sha; };
+static bool LoadManifest(const std::wstring& path, std::vector<ManEntry>& out) {
     std::string z;
     if (!ReadAll(path, z)) return false;
     size_t a = 0;
@@ -494,12 +572,22 @@ static bool LoadManifest(const std::wstring& path, std::unordered_map<std::wstri
         size_t b = z.find('\n', a);
         if (b == std::string::npos) b = z.size();
         if (z[a] != '#') {
-            size_t t1 = z.find('\t', a), t2 = t1 == std::string::npos ? t1 : z.find('\t', t1 + 1);
-            if (t2 != std::string::npos && t2 < b) {
-                uint64_t size = _strtoui64(z.c_str() + a, nullptr, 10), mt = _strtoui64(z.c_str() + t1 + 1, nullptr, 10);
-                std::string rel = z.substr(t2 + 1, b - t2 - 1);
-                if (!rel.empty() && rel.back() == '\r') rel.pop_back();
-                m[Lower(W8(rel))] = {size, mt};
+            std::string line = z.substr(a, b - a);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::vector<std::string> f;  // names cannot contain tabs, so the last field is always the path
+            for (size_t p = 0;;) {
+                size_t t = f.size() < 3 ? line.find('\t', p) : std::string::npos;
+                if (t == std::string::npos) { f.push_back(line.substr(p)); break; }
+                f.push_back(line.substr(p, t - p));
+                p = t + 1;
+            }
+            if (f.size() >= 3) {
+                ManEntry e;
+                e.size = _strtoui64(f[0].c_str(), nullptr, 10);
+                e.mtime = _strtoui64(f[1].c_str(), nullptr, 10);
+                if (f.size() == 4 && f[2] != "-") e.sha = f[2];
+                e.rel = W8(f.back());
+                if (!e.rel.empty()) out.push_back(std::move(e));
             }
         }
         a = b + 1;
@@ -520,23 +608,239 @@ static std::wstring FindPrevious(const std::wstring& root, bool versioned) {
     return !snap.empty() ? snap : (hasMirror ? mir : L"");
 }
 
+// ---------------------------------------------------------------------------------------------
+// SHA-256 checksums (Windows CNG)
+// ---------------------------------------------------------------------------------------------
+class Hasher {
+    BCRYPT_ALG_HANDLE alg{};
+    BYTE* buf{};
+    static const DWORD BUF = 1 << 20;  // page-aligned by VirtualAlloc, so unbuffered reads work
+public:
+    Hasher() {
+        if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) alg = nullptr;
+        buf = (BYTE*)VirtualAlloc(nullptr, BUF, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    }
+    ~Hasher() {
+        if (buf) VirtualFree(buf, 0, MEM_RELEASE);
+        if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    }
+    Hasher(const Hasher&) = delete;
+    Hasher& operator=(const Hasher&) = delete;
+    // Hex SHA-256 of a file, or "" if it cannot be read. `fromDisk` bypasses the file cache so a verification
+    // reads what is really stored. Progress is reported as job.workDone = base + bytes read.
+    std::string File(const std::wstring& path, bool fromDisk, uint64_t base) {
+        if (!alg || !buf) return {};
+        DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, fl = FILE_FLAG_SEQUENTIAL_SCAN;
+        HANDLE f = CreateFileW(XP(path).c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING, fl | (fromDisk ? FILE_FLAG_NO_BUFFERING : 0), nullptr);
+        if (f == INVALID_HANDLE_VALUE && fromDisk) f = CreateFileW(XP(path).c_str(), GENERIC_READ, share, nullptr, OPEN_EXISTING, fl, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return {};
+        BCRYPT_HASH_HANDLE h{};
+        UCHAR d[32];
+        bool ok = BCRYPT_SUCCESS(BCryptCreateHash(alg, &h, nullptr, 0, nullptr, 0, 0));
+        DWORD r = 0;
+        while (ok && !job.cancel && (ok = ReadFile(f, buf, BUF, &r, nullptr) != FALSE) && r) {
+            ok = BCRYPT_SUCCESS(BCryptHashData(h, buf, r, 0));
+            base += r;
+            job.workDone = base;
+        }
+        ok = ok && !job.cancel && BCRYPT_SUCCESS(BCryptFinishHash(h, d, sizeof(d), 0));
+        if (h) BCryptDestroyHash(h);
+        CloseHandle(f);
+        if (!ok) return {};
+        static const char* hx = "0123456789abcdef";
+        std::string s;
+        for (UCHAR c : d) { s += hx[c >> 4]; s += hx[c & 15]; }
+        return s;
+    }
+};
+
+// ---------------------------------------------------------------------------------------------
+// Volume Shadow Copy: a frozen, point-in-time view of the source volume, so open and locked files copy too
+// ---------------------------------------------------------------------------------------------
+static HRESULT VssWait(HRESULT hr, IVssAsync** pa) {
+    IVssAsync* a = *pa;
+    if (SUCCEEDED(hr) && a) {
+        hr = a->Wait();
+        HRESULT st = S_OK;
+        if (SUCCEEDED(hr) && SUCCEEDED(a->QueryStatus(&st, nullptr)) && st != VSS_S_ASYNC_FINISHED) hr = FAILED(st) ? st : E_FAIL;
+    }
+    if (a) a->Release();
+    *pa = nullptr;
+    return hr;
+}
+class Shadow {
+    ComPtr<IVssBackupComponents> bc;
+    std::wstring device, mount;  // \\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN and the volume root it mirrors (C:\)
+public:
+    // Shadow-copies the volume holding `path`. Returns "" on success, otherwise why not (the backup then reads live files).
+    std::wstring Create(const std::wstring& path) {
+        if (path.rfind(L"\\\\", 0) == 0) return L"network folders cannot be shadow-copied";
+        wchar_t mp[MAX_PATH + 1] = {}, vol[64] = {};
+        if (!GetVolumePathNameW(path.c_str(), mp, MAX_PATH) || !GetVolumeNameForVolumeMountPointW(mp, vol, 64)) return SysMsg(GetLastError());
+        using CreateFn = HRESULT(STDAPICALLTYPE*)(IVssBackupComponents**);
+        HMODULE lib = LoadLibraryW(L"vssapi.dll");
+        auto create = lib ? (CreateFn)(void*)GetProcAddress(lib, "CreateVssBackupComponentsInternal") : nullptr;
+        if (!create) return L"the Volume Shadow Copy service is not available";
+        IVssAsync* a = nullptr;
+        VSS_ID set{}, id{};
+        HRESULT hr = create(&bc);
+        if (SUCCEEDED(hr)) hr = bc->InitializeForBackup(nullptr);
+        if (SUCCEEDED(hr)) hr = bc->SetContext(VSS_CTX_BACKUP);
+        if (SUCCEEDED(hr)) hr = bc->SetBackupState(false, false, VSS_BT_COPY, false);  // copy backup: other backup tools' history is untouched
+        if (SUCCEEDED(hr)) hr = VssWait(bc->GatherWriterMetadata(&a), &a);
+        if (SUCCEEDED(hr)) hr = bc->StartSnapshotSet(&set);
+        if (SUCCEEDED(hr)) hr = bc->AddToSnapshotSet(vol, GUID_NULL, &id);
+        if (SUCCEEDED(hr)) hr = VssWait(bc->PrepareForBackup(&a), &a);
+        if (SUCCEEDED(hr)) hr = VssWait(bc->DoSnapshotSet(&a), &a);
+        VSS_SNAPSHOT_PROP p{};
+        if (SUCCEEDED(hr)) hr = bc->GetSnapshotProperties(id, &p);
+        if (FAILED(hr)) {
+            if (bc) bc->AbortBackup();
+            bc.Reset();
+            if (hr == E_ACCESSDENIED) return L"administrator rights are required";
+            wchar_t b[48];
+            swprintf_s(b, L"VSS error 0x%08lX", (unsigned long)hr);
+            return b;
+        }
+        device = p.m_pwszSnapshotDeviceObject ? p.m_pwszSnapshotDeviceObject : L"";
+        for (VSS_PWSZ s : {p.m_pwszSnapshotDeviceObject, p.m_pwszOriginalVolumeName, p.m_pwszOriginatingMachine, p.m_pwszServiceMachine, p.m_pwszExposedName, p.m_pwszExposedPath})
+            CoTaskMemFree(s);
+        mount = mp;
+        return {};
+    }
+    // The same path inside the shadow copy.
+    std::wstring Map(const std::wstring& live) const { return Join(device, live.size() > mount.size() ? live.substr(mount.size()) : L""); }
+    // A non-persistent backup shadow is deleted once its components object is released.
+    void Close() {
+        if (!bc) return;
+        IVssAsync* a = nullptr;
+        VssWait(bc->BackupComplete(&a), &a);
+        bc.Reset();
+    }
+    ~Shadow() { Close(); }
+};
+
+// Exclusive lock on a versions folder, so a scheduled run and the app never write the same destination at once.
+struct VersionsLock {
+    HANDLE h;
+    explicit VersionsLock(const std::wstring& root) {
+        h = CreateFileW(XP(Join(root, L".lock")).c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        DWORD e = GetLastError();
+        if (h == INVALID_HANDLE_VALUE)
+            throw Fail{e == ERROR_SHARING_VIOLATION ? L"Another backup or verification is already using this backup folder." : L"Cannot lock the backup folder: " + SysMsg(e)};
+    }
+    ~VersionsLock() { CloseHandle(h); }
+    VersionsLock(const VersionsLock&) = delete;
+    VersionsLock& operator=(const VersionsLock&) = delete;
+};
+
+// Retention: removes versioned snapshots beyond the newest `keep`, or older than `days` (0 = no limit).
+// The newest snapshot always stays. Unchanged files are hard links, so removing one never affects the others.
+static int Prune(const std::wstring& root, int keep, int days) {
+    if (keep <= 0 && days <= 0) return 0;
+    std::vector<std::wstring> names;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(XP(Join(root, L"snapshot_*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) names.push_back(fd.cFileName); } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(names.rbegin(), names.rend());  // newest first
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    FILETIME ft;
+    SystemTimeToFileTime(&st, &ft);
+    const uint64_t now = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime, day = 864000000000ULL;
+    int removed = 0;
+    for (size_t i = 1; i < names.size(); i++) {
+        bool drop = keep > 0 && (int)i >= keep;
+        int Y, M, D, hh, mm, ss;
+        if (!drop && days > 0 && swscanf_s(names[i].c_str() + 9, L"%d-%d-%d_%d-%d-%d", &Y, &M, &D, &hh, &mm, &ss) == 6) {
+            SYSTEMTIME t{(WORD)Y, (WORD)M, 0, (WORD)D, (WORD)hh, (WORD)mm, (WORD)ss, 0};
+            if (SystemTimeToFileTime(&t, &ft)) drop = now > (((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime) + (uint64_t)days * day;
+        }
+        if (!drop) continue;
+        SetCurrent(L"Removing old snapshot " + names[i].substr(9));
+        RemoveTree(Join(root, names[i]));
+        if (!IsDir(Join(root, names[i]))) removed++;
+    }
+    return removed;
+}
+
+struct VerifyResult { uint64_t checked = 0, ok = 0, bad = 0, missing = 0; std::vector<std::wstring> problems; };
+// Re-reads a snapshot from disk and compares every file with the SHA-256 recorded when it was backed up.
+// The outcome is saved as verify.json next to backup.json. Returns false when the snapshot has no manifest.
+static bool VerifySnapshot(const std::wstring& snapDir, VerifyResult& v) {
+    std::vector<ManEntry> man;
+    if (!LoadManifest(Join(snapDir, L"manifest.tsv"), man)) return false;
+    bool own = job.kind == 2;  // a standalone verification drives the progress counters
+    uint64_t base = job.workDone, total = 0;
+    for (auto& e : man) if (!e.sha.empty()) total += e.size + FILE_COST;
+    job.workTotal = base + total + 1;
+    if (own) job.phase = 2;
+    Hasher hs;
+    std::wstring files = Join(snapDir, L"files");
+    for (auto& e : man) {
+        if (job.cancel) throw Cancelled{};
+        if (e.sha.empty()) continue;
+        v.checked++;
+        if (own) job.scanned++;
+        SetCurrent(L"Verifying " + e.rel);
+        std::wstring p = Join(files, e.rel);
+        bool exists = Exists(p);
+        std::string h = exists ? hs.File(p, true, base) : std::string();
+        if (job.cancel) throw Cancelled{};
+        std::wstring problem;
+        if (h.empty()) { v.missing++; problem = e.rel + (exists ? L" (unreadable)" : L" (missing)"); }
+        else if (h != e.sha) { v.bad++; problem = e.rel + L" (checksum mismatch)"; }
+        else v.ok++;
+        if (!problem.empty() && v.problems.size() < 200) v.problems.push_back(problem);
+        if (own) { (problem.empty() ? job.copied : job.linked)++; job.bytesWritten += e.size; }
+        base += e.size + FILE_COST;
+        job.workDone = base;
+    }
+    if (!v.checked) return true;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t iso[32];
+    swprintf_s(iso, L"%04d-%02d-%02dT%02d:%02d:%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    std::wstring j = L"{\n  \"verified_iso\": \"" + std::wstring(iso) + L"\",\n";
+    j += L"  \"checked\": " + std::to_wstring(v.checked) + L",\n  \"ok\": " + std::to_wstring(v.ok) + L",\n";
+    j += L"  \"mismatched\": " + std::to_wstring(v.bad) + L",\n  \"missing\": " + std::to_wstring(v.missing) + L",\n  \"problems\": [";
+    for (size_t i = 0; i < v.problems.size(); i++) j += (i ? L",\n    \"" : L"\n    \"") + JsonEsc(v.problems[i]) + L"\"";
+    j += v.problems.empty() ? L"]\n}\n" : L"\n  ]\n}\n";
+    WriteAll(Join(snapDir, L"verify.json"), U8(j));
+    return true;
+}
+static std::wstring VerifySummary(const VerifyResult& v) {
+    uint64_t n = v.bad + v.missing;
+    if (!n) return L"Verified: all " + Num(v.checked) + L" files match their checksums.";
+    return L"Verification found " + Num(n) + (n == 1 ? L" problem" : L" problems") + L" in " + Num(v.checked) + L" files (" + Num(v.bad) +
+           L" changed, " + Num(v.missing) + L" missing or unreadable). See verify.json in the snapshot.";
+}
+
 struct BackupParams {
     std::wstring src, dst, desc;
     bool full, hardLinks, preserve, versioned, skipHidden;
     std::vector<std::wstring> patterns;
+    bool shadow, checksums, verify;
+    int keep, keepDays;
 };
 static void FinishJob(int phase, const std::wstring& msg, const std::wstring& dir = L"") {
+    std::wstring title;
     {
         std::lock_guard l(job.m);
         job.message = msg;
         job.resultDir = dir;
         job.current.clear();
         job.t1 = std::chrono::steady_clock::now();
+        title = job.title;
     }
+    LogEvent(title + L" | " + (phase == 4 ? (job.warnings ? L"WARNINGS" : L"OK") : phase == 6 ? L"CANCELLED" : L"FAILED") + L" | " + msg);
     job.phase = phase;
-    PostMessageW(g_hwnd, WM_APP_JOBDONE, 0, 0);
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP_JOBDONE, 0, 0);
 }
 static void BackupWorker(BackupParams P) {
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // for the Volume Shadow Copy service
     std::wstring work;
     try {
         std::wstring src = NormPath(P.src), dst = NormPath(P.dst);
@@ -545,6 +849,15 @@ static void BackupWorker(BackupParams P) {
         if (Lower(src) == Lower(dst)) throw Fail{L"Source and backup folders must be different."};
         if (IsUnder(src, root)) throw Fail{L"The source folder is inside the backup folder."};
         if (!MakeDirs(root)) throw Fail{L"Cannot create the backup folder: " + SysMsg(GetLastError())};
+        VersionsLock lock(root);
+        {  // leftovers of an interrupted run (power loss, killed process) are never valid snapshots
+            WIN32_FIND_DATAW fd;
+            HANDLE h = FindFirstFileExW(XP(Join(root, L"incomplete_*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+            if (h != INVALID_HANDLE_VALUE) {
+                do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(Join(root, fd.cFileName)); } while (FindNextFileW(h, &fd));
+                FindClose(h);
+            }
+        }
 
         SYSTEMTIME now; GetLocalTime(&now);
         std::wstring id = IdFromTime(now), prev = FindPrevious(root, P.versioned);
@@ -552,27 +865,39 @@ static void BackupWorker(BackupParams P) {
         std::wstring filesDir = Join(work, L"files");
         if (!MakeDirs(filesDir)) throw Fail{L"Cannot write to the backup folder: " + SysMsg(GetLastError())};
 
-        // 1. Scan
+        // 1. Optional shadow copy, then scan (from the shadow copy when there is one)
+        Shadow shadow;
+        std::wstring from = src, notes;
+        if (P.shadow) {
+            SetCurrent(L"Creating shadow copy...");
+            std::wstring why = shadow.Create(src);
+            if (why.empty()) from = shadow.Map(src);
+            else { notes = L" Shadow copy unavailable (" + why + L"), so open files may have been skipped."; job.warnings++; }
+        }
         ScanOpts o;
         o.patterns = P.patterns;
         o.skipHidden = P.skipHidden;
-        o.skipDir = IsUnder(root, src) ? Lower(root) : L"";  // never back up our own versions folder
+        o.skipDir = IsUnder(root, src) ? Lower(from == src ? root : shadow.Map(root)) : L"";  // never back up our own versions folder
         std::vector<FileItem> files;
         std::vector<DirItem> dirs;
-        Scan(src, L"", o, files, dirs);
+        Scan(from, L"", o, files, dirs);
         if (job.cancel) throw Cancelled{};
 
         // 2. Classify unchanged files against the previous snapshot
         bool incremental = !P.full && !prev.empty();
-        std::unordered_map<std::wstring, std::pair<uint64_t, uint64_t>> man;
-        bool haveManifest = incremental && LoadManifest(Join(prev, L"manifest.tsv"), man);
-        uint64_t copyBytes = 0, totalBytes = 0;
+        std::vector<ManEntry> prevMan;
+        bool haveManifest = incremental && LoadManifest(Join(prev, L"manifest.tsv"), prevMan);
+        std::unordered_map<std::wstring, const ManEntry*> man;
+        for (auto& e : prevMan) man[Lower(e.rel)] = &e;
+        uint64_t copyBytes = 0, hashBytes = 0, totalBytes = 0;
         for (auto& f : files) {
             totalBytes += f.size;
+            const ManEntry* pe = nullptr;
             if (incremental) {
                 if (haveManifest) {
                     auto it = man.find(Lower(f.rel));
-                    f.link = it != man.end() && it->second.first == f.size && it->second.second == f.mtime;
+                    pe = it == man.end() ? nullptr : it->second;
+                    f.link = pe && pe->size == f.size && pe->mtime == f.mtime;
                 } else {  // legacy snapshot without manifest: compare against the stored copy
                     WIN32_FILE_ATTRIBUTE_DATA a{};
                     if (GetFileAttributesExW(XP(Join(Join(prev, L"files"), f.rel)).c_str(), GetFileExInfoStandard, &a))
@@ -581,8 +906,12 @@ static void BackupWorker(BackupParams P) {
                 }
             }
             if (!f.link || !P.hardLinks) copyBytes += f.size;
+            if (P.checksums) {  // an unchanged file keeps the checksum it was stored with
+                if (f.link && pe && !pe->sha.empty()) f.sha = pe->sha;
+                else hashBytes += f.size;
+            }
         }
-        job.workTotal = copyBytes + files.size() * FILE_COST + 1;
+        job.workTotal = copyBytes + hashBytes + files.size() * FILE_COST + 1;
         job.phase = 2;
 
         // 3. Copy / link
@@ -591,10 +920,16 @@ static void BackupWorker(BackupParams P) {
         bool linksWork = true;
         std::vector<std::wstring> failedNames;
         std::wstring prevFiles = prev.empty() ? L"" : Join(prev, L"files");
+        Hasher hs;
         for (auto& f : files) {
             if (job.cancel) throw Cancelled{};
             SetCurrent(f.rel);
-            std::wstring out = Join(filesDir, f.rel), in = Join(src, f.rel);
+            std::wstring out = Join(filesDir, f.rel), in = Join(from, f.rel);
+            if (P.checksums && f.sha.empty()) {
+                f.sha = hs.File(in, false, base);
+                if (job.cancel) throw Cancelled{};
+                base += f.size;
+            }
             bool done = false;
             if (f.link) {
                 std::wstring old = Join(prevFiles, f.rel);
@@ -633,15 +968,20 @@ static void BackupWorker(BackupParams P) {
             base += (f.link && P.hardLinks ? 0 : f.size) + FILE_COST;
             job.workDone = base;
         }
+        bool shadowed = from != src;
+        shadow.Close();
 
         // 4. Finalize: directory times, manifest, metadata, atomic rename
         job.phase = 3;
+        SetCurrent(L"");
         if (P.preserve)
             for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SetTimes(Join(filesDir, it->rel), &it->c, &it->a, &it->w, true);
-        std::string manifest = "# Entropy Backup manifest v1: size<TAB>mtime<TAB>path\n";
-        manifest.reserve(files.size() * 64);
+        std::string manifest = P.checksums ? "# Entropy Backup manifest v2: size<TAB>mtime<TAB>sha256<TAB>path\n"
+                                           : "# Entropy Backup manifest v1: size<TAB>mtime<TAB>path\n";
+        manifest.reserve(files.size() * (P.checksums ? 130 : 64));
         for (auto& f : files)
-            if (!f.failed) manifest += std::to_string(f.size) + "\t" + std::to_string(f.mtime) + "\t" + U8(f.rel) + "\n";
+            if (!f.failed)
+                manifest += std::to_string(f.size) + "\t" + std::to_string(f.mtime) + "\t" + (P.checksums ? (f.sha.empty() ? "-" : f.sha) + "\t" : "") + U8(f.rel) + "\n";
         WriteAll(Join(work, L"manifest.tsv"), manifest);
 
         double secs;
@@ -659,6 +999,8 @@ static void BackupWorker(BackupParams P) {
         j += L"  \"description\": \"" + JsonEsc(P.desc) + L"\",\n";
         j += L"  \"type\": \"" + std::wstring(P.full ? L"full" : L"incremental") + L"\",\n";
         j += L"  \"hard_links\": " + std::wstring(P.hardLinks && !P.full ? L"true" : L"false") + L",\n";
+        j += L"  \"shadow_copy\": " + std::wstring(shadowed ? L"true" : L"false") + L",\n";
+        j += L"  \"checksums\": " + std::wstring(P.checksums ? L"true" : L"false") + L",\n";
         j += L"  \"previous\": \"" + JsonEsc(prev.empty() ? L"" : prev.substr(prev.find_last_of(L'\\') + 1)) + L"\",\n";
         j += L"  \"files\": " + std::to_wstring(files.size() - failed) + L",\n";
         j += L"  \"copied\": " + std::to_wstring(job.copied.load()) + L",\n";
@@ -680,7 +1022,22 @@ static void BackupWorker(BackupParams P) {
         work.clear();
 
         std::wstring msg = Num(files.size() - failed) + L" files protected, " + Num(job.linked.load()) + L" unchanged reused, " + Bytes(job.bytesWritten.load()) + L" written.";
-        if (failed) msg += L" " + Num(failed) + L" locked/unreadable files skipped.";
+        if (failed) { msg += L" " + Num(failed) + L" locked/unreadable files skipped."; job.warnings += failed; }
+        msg += notes;
+        // 5. Optional verification of what was written, then retention
+        if (P.verify && P.checksums) {
+            try {
+                VerifyResult v;
+                VerifySnapshot(final, v);
+                msg += L" " + VerifySummary(v);
+                job.warnings += v.bad + v.missing;
+            } catch (const Cancelled&) {
+                msg += L" Verification was cancelled; the snapshot was kept.";
+                job.warnings++;
+            }
+        }
+        if (P.versioned)
+            if (int n = Prune(root, P.keep, P.keepDays)) msg += L" Removed " + Num(n) + (n == 1 ? L" old snapshot." : L" old snapshots.");
         FinishJob(4, msg, final);
     } catch (const Fail& f) {
         if (!work.empty()) RemoveTree(work);
@@ -692,6 +1049,7 @@ static void BackupWorker(BackupParams P) {
         if (!work.empty()) RemoveTree(work);
         FinishJob(5, W8(e.what()));
     }
+    if (SUCCEEDED(co)) CoUninitialize();
 }
 static void RestoreWorker(std::wstring snapDir, std::wstring target, bool overwrite) {
     try {
@@ -737,6 +1095,23 @@ static void RestoreWorker(std::wstring snapDir, std::wstring target, bool overwr
         FinishJob(5, f.msg);
     } catch (const Cancelled&) {
         FinishJob(6, L"Restore cancelled. Files already restored were kept.");
+    } catch (const std::exception& e) {
+        FinishJob(5, W8(e.what()));
+    }
+}
+static void VerifyWorker(std::wstring snapDir, VerifyResult* out) {
+    try {
+        VersionsLock lock(snapDir.substr(0, snapDir.find_last_of(L'\\')));
+        VerifyResult v;
+        if (!VerifySnapshot(snapDir, v)) throw Fail{L"This snapshot has no manifest to verify against."};
+        if (!v.checked) throw Fail{L"This snapshot has no checksums. Turn on checksums on the Automation page and later snapshots will record them."};
+        job.warnings = v.bad + v.missing;
+        if (out) *out = v;
+        FinishJob(4, VerifySummary(v), snapDir);
+    } catch (const Fail& f) {
+        FinishJob(5, f.msg);
+    } catch (const Cancelled&) {
+        FinishJob(6, L"Verification cancelled.");
     } catch (const std::exception& e) {
         FinishJob(5, W8(e.what()));
     }
@@ -844,7 +1219,7 @@ static float TW(const std::wstring& s, float size, DWRITE_FONT_WEIGHT wt = REG) 
 // Vector icons (24-unit grid, scaled to size s)
 // ---------------------------------------------------------------------------------------------
 enum Ico { IC_NONE, IC_HOME, IC_HISTORY, IC_RESTORE, IC_GEAR, IC_EXCLUDE, IC_INFO, IC_FOLDER, IC_DRIVE, IC_DOC, IC_CUBE,
-           IC_DB, IC_CHEVRON, IC_DOTS, IC_HISTHDR, IC_FOLDEROPEN, IC_STOP, IC_CHECK };
+           IC_DB, IC_CHEVRON, IC_DOTS, IC_HISTHDR, IC_FOLDEROPEN, IC_STOP, IC_CHECK, IC_CALENDAR };
 static void Icon(int ic, float x, float y, float s, D2D1_COLOR_F c) {
     float u = s / 24.f, w = std::max(1.f, 1.7f * u);
     auto p = [&](float a, float b) { return P2(x + a * u, y + b * u); };
@@ -960,6 +1335,15 @@ static void Icon(int ic, float x, float y, float s, D2D1_COLOR_F c) {
         break;
     case IC_CHECK:
         stroke(Geo([&](ID2D1GeometrySink* k) { Poly(k, {p(-5.5f, 0.5f), p(-1.5f, 4.5f), p(6, -4.5f)}, false); }).Get(), 2.4f * u);
+        break;
+    case IC_CALENDAR:
+        R->DrawRoundedRectangle(D2D1::RoundedRect(RC(x - 8.5f * u, y - 6.5f * u, x + 8.5f * u, y + 8.5f * u), 2.5f * u, 2.5f * u), br.Get(), w);
+        stroke(Geo([&](ID2D1GeometrySink* k) {
+            Poly(k, {p(-8.5f, -1.5f), p(8.5f, -1.5f)}, false);
+            Poly(k, {p(-4, -9), p(-4, -4.5f)}, false);
+            Poly(k, {p(4, -9), p(4, -4.5f)}, false);
+            Poly(k, {p(-3.5f, 3.5f), p(-0.5f, 6), p(4, 1)}, false);
+        }).Get(), w);
         break;
     }
 }
@@ -1205,20 +1589,150 @@ static HICON MakeIcon(int px) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Scheduled backups: a Windows Task Scheduler task, so they also run while the app is closed
+// ---------------------------------------------------------------------------------------------
+static const wchar_t* TASK_NAME = L"Entropy Backup";
+static const CLSID CLSID_TaskSched = {0x0f87369f, 0xa4e5, 0x4cfc, {0xbd, 0x3e, 0x73, 0xe6, 0x15, 0x45, 0x72, 0xdd}};
+static const wchar_t* DAY_NAMES[7] = {L"Sunday", L"Monday", L"Tuesday", L"Wednesday", L"Thursday", L"Friday", L"Saturday"};
+struct TaskInfo { bool exists = false, enabled = false; std::wstring summary, next, last; LONG lastResult = 0; };
+static TaskInfo taskInfo;
+
+struct Bstr {
+    BSTR b;
+    explicit Bstr(const std::wstring& s) : b(SysAllocString(s.c_str())) {}
+    ~Bstr() { SysFreeString(b); }
+    Bstr(const Bstr&) = delete;
+    Bstr& operator=(const Bstr&) = delete;
+    operator BSTR() const { return b; }
+};
+// Quotes one argument so CommandLineToArgvW reads it back unchanged (paths never contain quotes).
+static std::wstring QuoteArg(const std::wstring& a) {
+    std::wstring q = L"\"" + a;
+    for (size_t i = a.size(); i > 0 && a[i - 1] == L'\\'; i--) q += L'\\';
+    return q + L"\"";
+}
+static std::wstring XmlEsc(const std::wstring& s) {
+    std::wstring o;
+    for (wchar_t c : s) o += c == L'&' ? L"&amp;" : c == L'<' ? L"&lt;" : c == L'>' ? L"&gt;" : c == L'"' ? L"&quot;" : std::wstring(1, c);
+    return o;
+}
+static std::wstring HexCode(LONG v) { wchar_t b[16]; swprintf_s(b, L"0x%08lX", (unsigned long)v); return b; }
+static std::wstring ScheduleText() {
+    wchar_t t[8];
+    swprintf_s(t, L"%02d:%02d", cfg.schedHour, cfg.schedMin);
+    if (cfg.schedMode == 1) return std::wstring(L"Every hour, starting at ") + t;
+    if (cfg.schedMode == 3) return std::wstring(L"Every ") + DAY_NAMES[cfg.schedDay] + L" at " + t;
+    return std::wstring(L"Every day at ") + t;
+}
+static std::wstring TaskResultText(LONG r) {
+    switch (r) {
+    case 0: return L"succeeded";
+    case 1: return L"finished with warnings";
+    case 2: return L"failed";
+    case 3: return L"invalid arguments";
+    case 4: return L"cancelled";
+    case 0x41301: return L"running now";  // SCHED_S_TASK_RUNNING
+    default: return L"result " + HexCode(r);
+    }
+}
+static ComPtr<ITaskFolder> TaskRoot() {
+    ComPtr<ITaskService> ts;
+    ComPtr<ITaskFolder> f;
+    VARIANT none{};
+    if (SUCCEEDED(CoCreateInstance(CLSID_TaskSched, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&ts))) && SUCCEEDED(ts->Connect(none, none, none, none)))
+        ts->GetFolder(Bstr(L"\\"), &f);
+    return f;
+}
+static std::wstring OleDate(DATE d) {
+    SYSTEMTIME t;
+    if (!VariantTimeToSystemTime(d, &t) || t.wYear < 2000) return {};  // "never" is reported as 1999
+    std::wstring date, time;
+    FormatId(IdFromTime(t), date, time);
+    return date + L" " + time;
+}
+static void RefreshTask() {
+    taskInfo = {};
+    auto f = TaskRoot();
+    ComPtr<IRegisteredTask> t;
+    if (!f || FAILED(f->GetTask(Bstr(TASK_NAME), &t))) return;
+    taskInfo.exists = true;
+    taskInfo.summary = IniGet(L"ScheduleSummary", L"A backup is scheduled.");
+    VARIANT_BOOL en = VARIANT_FALSE;
+    DATE d = 0;
+    t->get_Enabled(&en);
+    taskInfo.enabled = en != VARIANT_FALSE;
+    if (SUCCEEDED(t->get_NextRunTime(&d))) taskInfo.next = OleDate(d);
+    if (SUCCEEDED(t->get_LastTaskResult(&taskInfo.lastResult)) && taskInfo.lastResult != 0x41303 && SUCCEEDED(t->get_LastRunTime(&d)))  // 0x41303: has not run
+        taskInfo.last = OleDate(d);
+}
+// Registers, updates or removes the task to match the Automation page. Returns a message for the page.
+static std::wstring ApplySchedule() {
+    auto f = TaskRoot();
+    if (!f) return L"Task Scheduler is not available.";
+    if (cfg.schedMode == 0) {
+        HRESULT hr = f->DeleteTask(Bstr(TASK_NAME), 0);
+        return SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ? L"Scheduled backups are off." : L"Could not remove the schedule (" + HexCode(hr) + L").";
+    }
+    if (cfg.from.empty() || cfg.to.empty()) return L"Set From and To on the Backup page first.";
+    std::wstring from = NormPath(cfg.from), to = cfg.to;
+    wchar_t exe[MAX_PATH], start[32];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    swprintf_s(start, L"%04d-%02d-%02dT%02d:%02d:00", t.wYear, t.wMonth, t.wDay, cfg.schedHour, cfg.schedMin);
+    std::wstring trig = cfg.schedMode == 1
+        ? L"<TimeTrigger><Repetition><Interval>PT1H</Interval></Repetition><StartBoundary>" + std::wstring(start) + L"</StartBoundary></TimeTrigger>"
+        : L"<CalendarTrigger><StartBoundary>" + std::wstring(start) + L"</StartBoundary>" +
+              (cfg.schedMode == 2 ? std::wstring(L"<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>")
+                                  : L"<ScheduleByWeek><DaysOfWeek><" + std::wstring(DAY_NAMES[cfg.schedDay]) + L" /></DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>") +
+              L"</CalendarTrigger>";
+    std::wstring args = L"backup --scheduled --from " + QuoteArg(from) + L" --to " + QuoteArg(to);
+    std::wstring xml =
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+        L"<RegistrationInfo><Author>Entropy Backup</Author><Description>" +
+        XmlEsc(L"Backs up " + from + L" to " + to + L". Other options come from the Entropy Backup settings.") +
+        L"</Description></RegistrationInfo><Triggers>" + trig + L"</Triggers>"
+        L"<Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>" + (cfg.shadow ? L"HighestAvailable" : L"LeastPrivilege") +
+        L"</RunLevel></Principal></Principals>"
+        L"<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable>"
+        L"<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Priority>7</Priority></Settings>"
+        L"<Actions Context=\"Author\"><Exec><Command>" + XmlEsc(exe) + L"</Command><Arguments>" + XmlEsc(args) + L"</Arguments></Exec></Actions></Task>";
+    ComPtr<IRegisteredTask> reg;
+    VARIANT none{};
+    HRESULT hr = f->RegisterTask(Bstr(TASK_NAME), Bstr(xml), TASK_CREATE_OR_UPDATE, none, none, TASK_LOGON_INTERACTIVE_TOKEN, none, &reg);
+    if (hr == E_ACCESSDENIED && cfg.shadow)
+        return L"Saving a schedule that uses shadow copies needs administrator rights. Run the app as administrator once, or turn off shadow copy.";
+    if (FAILED(hr)) return L"Could not save the schedule (" + HexCode(hr) + L").";
+    IniSet(L"ScheduleSummary", ScheduleText() + L":  " + from + L"  →  " + to);
+    return L"Schedule saved.";
+}
+static std::wstring CliCommand(const std::wstring& from, const std::wstring& to) {
+    std::wstring exe = Join(g_exeDir, L"EntropyBackupCLI.exe");
+    if (!Exists(exe)) {
+        wchar_t e[MAX_PATH];
+        GetModuleFileNameW(nullptr, e, MAX_PATH);
+        exe = e;
+    }
+    return QuoteArg(exe) + L" backup --from " + QuoteArg(from.empty() ? L"<project folder>" : from) + L" --to " + QuoteArg(to.empty() ? L"<backup folder>" : to);
+}
+
+// ---------------------------------------------------------------------------------------------
 // UI state, hit regions and widgets
 // ---------------------------------------------------------------------------------------------
-enum Page { PG_BACKUP, PG_HISTORY, PG_RESTORE, PG_SETTINGS, PG_EXCLUDES, PG_ABOUT };
+enum Page { PG_BACKUP, PG_HISTORY, PG_RESTORE, PG_AUTO, PG_SETTINGS, PG_EXCLUDES, PG_ABOUT, PG_COUNT };
 enum Id {
     ID_NONE = 0, ID_NAV = 1,
     ID_BROWSE_FROM = 20, ID_BROWSE_TO, ID_RADIO_INC, ID_RADIO_FULL, ID_CHK_LINK, ID_CHK_PRESERVE, ID_CHK_VERSIONED, ID_CHK_OPEN,
     ID_BACKUP, ID_CANCEL, ID_HIST_MENU, ID_OPEN_VERSIONS, ID_H_OPEN, ID_H_RESTORE, ID_R_BROWSE, ID_R_OVERWRITE, ID_R_GO, ID_R_EXPLORE,
     ID_S_REMEMBER, ID_S_HIDDEN, ID_S_BG_PICK, ID_S_BG_RESET, ID_S_BANNER, ID_S_TINT, ID_S_FROST, ID_S_LOOK_RESET, ID_S_OPENDIR, ID_X_DEFAULTS, ID_X_SAVE, ID_A_DATA,
     ID_CAP_MIN, ID_CAP_MAX, ID_CAP_CLOSE, ID_S_OUTLINE, ID_S_COLA, ID_S_COLB, ID_S_SWAP, ID_S_SPAN, ID_S_OWIDTH, ID_S_OGLOW,
-    ID_S_STYLE = 900, ID_CARD = 1000, ID_LIST = 3000
+    ID_H_VERIFY, ID_AU_APPLY, ID_AU_VSS, ID_AU_SUMS, ID_AU_VERIFY, ID_AU_COPY,
+    ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_CARD = 1000, ID_LIST = 3000
 };
-enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL };
+enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL, IDC_TIME, IDC_KEEP, IDC_DAYS };
 static int page = PG_BACKUP, hoverId = 0, pressId = 0, dragId = 0;
-static HWND editFrom{}, editTo{}, editDesc{}, editRestore{}, editExcl{};
+static HWND editFrom{}, editTo{}, editDesc{}, editRestore{}, editExcl{}, editTime{}, editKeep{}, editDays{};
 static HFONT editFont{};
 static int editFontH = 0;
 static HBRUSH fieldBrush{};
@@ -1246,6 +1760,11 @@ static void ComputeFit(float cw, float ch) {
     goy = (ch - DH * gs) / 2;
 }
 
+static std::wstring EditText(HWND e) {
+    std::vector<wchar_t> b((size_t)GetWindowTextLengthW(e) + 1);
+    GetWindowTextW(e, b.data(), (int)b.size());
+    return b.data();
+}
 static void Glass(D2D1_RECT_F r, float rad, bool gold) {
     for (int i = 1; i <= 5; i++) {
         float e = i * 2.4f;
@@ -1412,8 +1931,8 @@ static void SnapCards(D2D1_RECT_F area, int& scroll, int idBase, float ih, bool 
 // ---------------------------------------------------------------------------------------------
 // Screens
 // ---------------------------------------------------------------------------------------------
-static const wchar_t* NAV[6] = {L"Backup", L"History", L"Restore", L"Settings", L"Excludes", L"About"};
-static const int NAV_ICON[6] = {IC_HOME, IC_HISTORY, IC_RESTORE, IC_GEAR, IC_EXCLUDE, IC_INFO};
+static const wchar_t* NAV[PG_COUNT] = {L"Backup", L"History", L"Restore", L"Automation", L"Settings", L"Excludes", L"About"};
+static const int NAV_ICON[PG_COUNT] = {IC_HOME, IC_HISTORY, IC_RESTORE, IC_CALENDAR, IC_GEAR, IC_EXCLUDE, IC_INFO};
 
 static void DrawSidebar() {
     Glass(RC(14, 58, 318, 936), 24, false);
@@ -1427,7 +1946,7 @@ static void DrawSidebar() {
         R->DrawTextLayout(P2(14, 256), L.Get(), SB(C(0xF4F7FB)).Get());
     }
     Text(L"Your Code. Always Within Reach.", RC(14, 304, 318, 330), 16, C(0xAAB9CC), REG, CENTER);
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < PG_COUNT; i++) {
         float y = 352 + i * 56.f;
         auto r = RC(32, y, 300, y + 50);
         bool act = page == i, hv = hoverId == ID_NAV + i;
@@ -1450,9 +1969,10 @@ static void DrawSidebar() {
 }
 static void DrawHeader() {
     struct H { const wchar_t* t; const wchar_t* s; int ic; };
-    static const H hs[6] = {{L"Project Backup", L"Incremental. Versioned. Simple.", IC_CUBE},
+    static const H hs[PG_COUNT] = {{L"Project Backup", L"Incremental. Versioned. Simple.", IC_CUBE},
                             {L"Version History", L"Every snapshot, ready when you need it.", IC_HISTORY},
                             {L"Restore", L"Bring any version back in one step.", IC_RESTORE},
+                            {L"Automation", L"Schedules, retention and integrity checks.", IC_CALENDAR},
                             {L"Settings", L"Tune how Entropy Backup works.", IC_GEAR},
                             {L"Excludes", L"Keep build output and clutter out of snapshots.", IC_EXCLUDE},
                             {L"About", L"Entropy Backup for Windows 11.", IC_INFO}};
@@ -1520,14 +2040,19 @@ static void DrawHistoryPage() {
     float y = 232;
     DetailRow(y, L"Description", s.desc, 3);
     DetailRow(y, L"Source", s.source, 2);
-    DetailRow(y, L"Type", s.type.empty() ? L"" : (s.type == L"full" ? L"Full copy" : L"Incremental"));
+    DetailRow(y, L"Type", s.type.empty() ? L"" : (s.type == L"full" ? L"Full copy" : L"Incremental") + std::wstring(s.shadow ? L"  \u00B7  shadow copy" : L""));
     DetailRow(y, L"Files", s.files ? Num(s.files) : L"");
     DetailRow(y, L"Copied", s.created.empty() ? L"" : Num(s.copied));
     DetailRow(y, L"Unchanged", s.created.empty() ? L"" : Num(s.reused) + L" (linked)");
     DetailRow(y, L"Data written", s.created.empty() ? L"" : Bytes(s.bytes) + (s.bytesTotal ? L" of " + Bytes(s.bytesTotal) : L""));
     DetailRow(y, L"Duration", s.seconds > 0 ? Dur(s.seconds) : L"");
     if (s.failed) DetailRow(y, L"Skipped", Num(s.failed) + L" unreadable files");
-    Button(ID_H_OPEN, RC(720, 626, 1088, 672), L"Open Snapshot Folder", BS_SECOND, IC_FOLDEROPEN);
+    DetailRow(y, L"Checksums", !s.sums ? L"Not recorded"
+                               : !s.verified ? L"Recorded, not verified yet"
+                               : s.vBad ? Num(s.vBad) + L" problems found " + s.vWhen
+                               : L"Verified " + s.vWhen);
+    Button(ID_H_OPEN, RC(720, 626, 898, 672), L"Open Folder", BS_SECOND, IC_FOLDEROPEN, false, true, 15);
+    Button(ID_H_VERIFY, RC(910, 626, 1088, 672), L"Verify", BS_SECOND, IC_CHECK, false, s.sums && !Running(), 15);
     Button(ID_H_RESTORE, RC(720, 684, 1088, 734), L"Restore This Version", BS_PRIMARY, IC_RESTORE, true, !Running(), 17);
 }
 static void DrawRestorePage() {
@@ -1555,6 +2080,16 @@ static void DrawRestorePage() {
     Text(L"Restoring never modifies the snapshot itself \u2014 every version stays intact.", RC(720, 560, 1088, 610), 13.5f, C(0x9CB0C5), REG, LEFT, true, VTOP);
     Button(ID_R_GO, RC(720, 684, 1088, 734), Running() ? L"Working..." : L"Restore Now", BS_PRIMARY, IC_RESTORE, true, !Running() && !snaps.empty(), 18);
 }
+// Pill-shaped option button; one of a row is `on`.
+static void Chip(int id, D2D1_RECT_F r, const std::wstring& label, bool on, bool en) {
+    bool hv = en && hoverId == id;
+    float al = en ? 1.f : 0.4f;
+    if (on) FillRR(r, 15, LG(P2(0, r.top), P2(0, r.bottom), {{0, C(0xF6DA94, 0.85f * al)}, {1, C(0xC99B45, 0.85f * al)}}).Get());
+    else FillRR(r, 15, SB(C(0xFFFFFF, (hv ? 0.14f : 0.06f) * al)).Get());
+    StrokeRR(r, 15, SB(C(on ? 0xFFE9B0 : 0xFFFFFF, (on ? 0.9f : 0.25f) * al)).Get(), 1.1f);
+    Text(label, r, 13.5f, on ? C(0x14213A, al) : C(0xE6EDF5, al), SEMI, CENTER);
+    if (en) AddHot(id, r);
+}
 static void Swatch(int id, float x, float y, UINT32 col, bool en) {
     auto r = RC(x, y - 15, x + 62, y + 15);
     float al = en ? 1.f : 0.4f;
@@ -1563,6 +2098,51 @@ static void Swatch(int id, float x, float y, UINT32 col, bool en) {
     FillRR(RC(r.left, r.top, r.right, y), 8, LG(P2(0, r.top), P2(0, y), {{0, C(0xFFFFFF, 0.25f * al)}, {1, C(0xFFFFFF, 0)}}).Get());
     StrokeRR(r, 8, SB(C(0xFFFFFF, 0.5f * al)).Get(), 1.2f);
     if (en) AddHot(id, r);
+}
+static void DrawAutomationPage() {
+    Glass(PagePanel(), 22, false);
+    D2D1_COLOR_F gold = C(0xEBC56C), dim = C(0x9CB0C5), lc = C(0xDCE4EE), sep = C(0xAACBEA, 0.15f);
+    Text(L"Scheduled Backups", RC(360, 156, 800, 186), 18, gold, SEMI);
+    if (!flash.empty()) Text(flash, RC(560, 156, 1088, 186), 14, gold, REG, RIGHT);
+    Text(L"Run", RC(362, 196, 520, 226), 15, lc);
+    static const wchar_t* freq[4] = {L"Off", L"Hourly", L"Daily", L"Weekly"};
+    for (int i = 0; i < 4; i++) Chip(ID_AU_FREQ + i, RC(520 + i * 95.f, 196, 609 + i * 95.f, 226), freq[i], cfg.schedMode == i, true);
+    bool on = cfg.schedMode != 0;
+    Text(cfg.schedMode == 1 ? L"Starting at" : L"At", RC(362, 234, 520, 268), 15, C(0xDCE4EE, on ? 1.f : 0.4f));
+    Field(RC(520, 234, 609, 268), editTime);
+    static const wchar_t* days[7] = {L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat"};
+    for (int i = 0; i < 7; i++) Chip(ID_AU_DAY + i, RC(625 + i * 66.f, 236, 685 + i * 66.f, 266), days[i], cfg.schedDay == i, cfg.schedMode == 3);
+    std::wstring st1 = L"No backup is scheduled.", st2;
+    if (taskInfo.exists) {
+        st1 = taskInfo.summary + (taskInfo.enabled ? L"" : L"  (disabled in Task Scheduler)");
+        st2 = L"Next run: " + (taskInfo.next.empty() ? std::wstring(L"—") : taskInfo.next) + L"     Last run: " +
+              (taskInfo.last.empty() ? std::wstring(L"never") : taskInfo.last + L" (" + TaskResultText(taskInfo.lastResult) + L")");
+    }
+    Text(st1, RC(362, 276, 1088, 298), 14.5f, C(0xE8EEF5));
+    Text(st2, RC(362, 298, 1088, 320), 13.5f, dim);
+    Button(ID_AU_APPLY, RC(360, 328, 560, 366), L"Save Schedule", BS_SECOND, IC_CHECK, false, true, 15);
+    Text(L"Runs in the background while you are signed in, even with the app closed. A missed run starts as soon as possible.",
+         RC(576, 328, 1088, 366), 13, dim, REG, LEFT, true, VMID);
+    Line(360, 378, 1088, 378, sep, 1);
+
+    Text(L"Retention", RC(360, 386, 800, 416), 18, gold, SEMI);
+    Text(L"Keep the newest", RC(362, 422, 520, 456), 15, lc);
+    Field(RC(520, 422, 609, 456), editKeep);
+    Text(L"snapshots   (0 = keep all)", RC(622, 422, 1088, 456), 14.5f, dim);
+    Text(L"Delete after", RC(362, 460, 520, 494), 15, lc);
+    Field(RC(520, 460, 609, 494), editDays);
+    Text(L"days   (0 = never; the newest snapshot always stays)", RC(622, 460, 1088, 494), 14.5f, dim);
+    Line(360, 504, 1088, 504, sep, 1);
+
+    Text(L"Integrity", RC(360, 512, 800, 542), 18, gold, SEMI);
+    Check(ID_AU_VSS, 362, 560, L"Copy open and locked files with a Volume Shadow Copy  (needs administrator)", cfg.shadow);
+    Check(ID_AU_SUMS, 362, 590, L"Record a SHA-256 checksum for every file", cfg.checksums);
+    Check(ID_AU_VERIFY, 362, 620, L"Verify each new snapshot against its checksums", cfg.verifyAfter && cfg.checksums, cfg.checksums);
+    Line(360, 640, 1088, 640, sep, 1);
+
+    Text(L"Command Line", RC(360, 648, 700, 678), 18, gold, SEMI);
+    Button(ID_AU_COPY, RC(938, 646, 1088, 678), L"Copy", BS_GHOST, IC_DOC, false, true, 14);
+    Text(CliCommand(EditText(editFrom), NormPath(EditText(editTo))), RC(362, 684, 1088, 734), 13, C(0xC8D4E2), REG, LEFT, true, VTOP);
 }
 static void DrawSettingsPage() {
     Glass(PagePanel(), 22, false);
@@ -1598,16 +2178,7 @@ static void DrawSettingsPage() {
     Check(ID_S_SPAN, 920, 570, L"Flow across window", cfg.outSpan, en, 14);
     Text(L"Gradient", RC(362, 592, 520, 620), 15, lc);
     static const wchar_t* styles[6] = {L"Horizontal", L"Vertical", L"Diagonal", L"Reverse", L"Mirror", L"Radial"};
-    for (int i = 0; i < 6; i++) {
-        auto r = RC(520 + i * 95.f, 592, 609 + i * 95.f, 622);
-        bool on = cfg.outStyle == i, hv = en && hoverId == ID_S_STYLE + i;
-        float al = en ? 1.f : 0.4f;
-        if (on) FillRR(r, 15, LG(P2(0, r.top), P2(0, r.bottom), {{0, C(0xF6DA94, 0.85f * al)}, {1, C(0xC99B45, 0.85f * al)}}).Get());
-        else FillRR(r, 15, SB(C(0xFFFFFF, (hv ? 0.14f : 0.06f) * al)).Get());
-        StrokeRR(r, 15, SB(C(on ? 0xFFE9B0 : 0xFFFFFF, (on ? 0.9f : 0.25f) * al)).Get(), 1.1f);
-        Text(styles[i], r, 13.5f, on ? C(0x14213A, al) : C(0xE6EDF5, al), SEMI, CENTER);
-        if (en) AddHot(ID_S_STYLE + i, r);
-    }
+    for (int i = 0; i < 6; i++) Chip(ID_S_STYLE + i, RC(520 + i * 95.f, 592, 609 + i * 95.f, 622), styles[i], cfg.outStyle == i, en);
     Slider(ID_S_OWIDTH, 520, 650, 380, L"Thickness", cfg.outWidth, en);
     Slider(ID_S_OGLOW, 520, 684, 380, L"Glow", cfg.outGlow, en);
     Text(L"Settings, excludes and the runtime log live in the data folder (About page).", RC(362, 708, 1088, 732), 13, C(0x9CB0C5));
@@ -1691,20 +2262,20 @@ static void DrawProgress() {
     Text(pc, RC(px, cy - 22, px + w1 + 2, cy + 20), cb ? 26.f : 30.f, C(0xF7F9FC), SEMI);
     Text(L"%", RC(px + w1, cy - 6, px + w1 + w2 + 4, cy + 16), cb ? 14.f : 16.f, C(0xF7F9FC), SEMI);
 
-    const wchar_t* title = L"Ready to back up";
-    if (ph == 1) title = rest ? L"Preparing restore..." : L"Scanning project...";
-    else if (ph == 2) title = rest ? L"Restoring files..." : L"Backing up files...";
-    else if (ph == 3) title = L"Finalizing snapshot...";
-    else if (ph == 4) title = rest ? L"Restore complete" : L"Backup complete";
-    else if (ph == 5) title = rest ? L"Restore failed" : L"Backup failed";
-    else if (ph == 6) title = rest ? L"Restore cancelled" : L"Backup cancelled";
-    Text(title, cb ? RC(ox, 782, 950, 810) : RC(ox, 726, 950, 758), cb ? 20.f : 22.f, ph == 5 ? C(0xFF9C8A) : C(0xF7F9FC), SEMI);
+    int kind = job.kind;  // 0 backup, 1 restore, 2 verify
+    static const wchar_t* titles[3][7] = {
+        {L"Ready to back up", L"Scanning project...", L"Backing up files...", L"Finalizing snapshot...", L"Backup complete", L"Backup failed", L"Backup cancelled"},
+        {L"Ready to back up", L"Preparing restore...", L"Restoring files...", L"Finalizing...", L"Restore complete", L"Restore failed", L"Restore cancelled"},
+        {L"Ready to back up", L"Preparing verification...", L"Verifying checksums...", L"Finalizing...", L"Verification passed", L"Verification failed", L"Verification cancelled"}};
+    const wchar_t* title = ph == 4 && kind == 2 && job.warnings ? L"Verification found problems" : titles[kind][std::clamp(ph, 0, 6)];
+    bool bad = ph == 5 || (ph == 4 && kind == 2 && job.warnings);
+    Text(title, cb ? RC(ox, 782, 950, 810) : RC(ox, 726, 950, 758), cb ? 20.f : 22.f, bad ? C(0xFF9C8A) : C(0xF7F9FC), SEMI);
     std::wstring line = msg;
     if (ph == 0 && GetWindowTextLengthW(editFrom) && GetWindowTextLengthW(editTo) && msg == IDLE_MESSAGE)
         line = L"Folders are set. Press Back Up Now to create a snapshot.";
-    if (ph == 1) line = L"Scanning: " + cur;
-    else if (ph == 2) line = (rest ? L"Restoring: " : L"Copying: ") + cur;
-    else if (ph == 3) line = L"Writing manifest and metadata...";
+    if (ph == 1) line = cur.rfind(L"Creating", 0) == 0 ? cur : L"Scanning: " + cur;
+    else if (ph == 2) line = kind == 2 ? cur : (rest ? L"Restoring: " : L"Copying: ") + cur;
+    else if (ph == 3) line = cur.empty() ? L"Writing manifest and metadata..." : cur;
     Text(line, cb ? RC(ox, 810, 950, 836) : RC(ox, 760, 950, 786), 15.5f, C(0xB5C5D5));
     Button(ID_CANCEL, cb ? RC(962, 786, 1088, 828) : RC(962, 728, 1088, 770), L"Cancel", BS_GHOST, IC_STOP, false, run && !job.cancel, 15);
 
@@ -1712,8 +2283,9 @@ static void DrawProgress() {
     FillRR(bar, 5, SB(C(0xFFFFFF, 0.12f)).Get());
     if (f > 0.002) FillRR(RC(bar.left, bar.top, bar.left + (bar.right - bar.left) * (float)f, bar.bottom), 5, LG(P2(bar.left, 0), P2(bar.right, 0), {{0, C(0xFBE3A0)}, {1, C(0xD9A944)}}).Get());
 
-    const wchar_t* labels[6] = {L"Files Scanned", rest ? L"Files Restored" : L"Files Copied", rest ? L"Skipped (Existing)" : L"Unchanged (Linked)",
-                                L"Size Written", L"Elapsed", L"Est. Remaining"};
+    const wchar_t* labels[6] = {kind == 2 ? L"Files Checked" : L"Files Scanned", kind == 2 ? L"Matched" : rest ? L"Files Restored" : L"Files Copied",
+                                kind == 2 ? L"Problems" : rest ? L"Skipped (Existing)" : L"Unchanged (Linked)", kind == 2 ? L"Size Read" : L"Size Written",
+                                L"Elapsed", L"Est. Remaining"};
     std::wstring eta = L"--:--:--";
     if (ph == 2 && f > 0.01) eta = Dur(el * (1 - f) / f);
     else if (ph == 4) eta = Dur(0);
@@ -1758,7 +2330,8 @@ static void DrawQuickBackupPanel() {
                      : L"Snapshot \u201C" + (name.empty() ? f : name) + L"\u201D now.";
     Text(sub, RC(1146, ty + 38, 1446, ty + 62), 14.5f, C(0xB5C5D5));
     float by = cb ? 866.f : 860.f;
-    Button(ID_BACKUP, RC(1146, by, 1446, by + 52), run ? (job.kind == 0 ? L"Backing Up..." : L"Restoring...") : L"Back Up Now", BS_PRIMARY, IC_DB, !run, !run, 18);
+    static const wchar_t* busy[3] = {L"Backing Up...", L"Restoring...", L"Verifying..."};
+    Button(ID_BACKUP, RC(1146, by, 1446, by + 52), run ? busy[std::clamp((int)job.kind, 0, 2)] : L"Back Up Now", BS_PRIMARY, IC_DB, !run, !run, 18);
 }
 static void DrawCaption(float cw) {
     float k = std::max(0.8f, gs), bw = 46 * k, bh = 34 * k, x = cw - 3 * bw;
@@ -1838,6 +2411,7 @@ static void Paint() {
     case PG_BACKUP: DrawBackupPage(); break;
     case PG_HISTORY: DrawHistoryPage(); break;
     case PG_RESTORE: DrawRestorePage(); break;
+    case PG_AUTO: DrawAutomationPage(); break;
     case PG_SETTINGS: DrawSettingsPage(); break;
     case PG_EXCLUDES: DrawExcludesPage(); break;
     case PG_ABOUT: DrawAboutPage(); break;
@@ -1856,15 +2430,20 @@ static void Paint() {
 // ---------------------------------------------------------------------------------------------
 // Child edit controls
 // ---------------------------------------------------------------------------------------------
-static std::wstring EditText(HWND e) {
-    std::vector<wchar_t> b((size_t)GetWindowTextLengthW(e) + 1);
-    GetWindowTextW(e, b.data(), (int)b.size());
-    return b.data();
-}
 static void ReadEdits() {
     cfg.from = EditText(editFrom);
     cfg.to = NormPath(EditText(editTo));
     cfg.excludes = EditText(editExcl);
+    cfg.keepCount = std::clamp(_wtoi(EditText(editKeep).c_str()), 0, 99999);
+    cfg.keepDays = std::clamp(_wtoi(EditText(editDays).c_str()), 0, 99999);
+}
+// Reads HH:MM from the schedule time field; false (settings unchanged) if it is not a valid time.
+static bool ReadTime() {
+    int h = -1, m = -1;
+    if (swscanf_s(EditText(editTime).c_str(), L"%d:%d", &h, &m) != 2 || h < 0 || h > 23 || m < 0 || m > 59) return false;
+    cfg.schedHour = h;
+    cfg.schedMin = m;
+    return true;
 }
 static void PlaceEdit(HWND e, D2D1_RECT_F d) {
     auto p = ToPx(d);
@@ -1876,6 +2455,8 @@ static void ShowControls() {
     ShowWindow(editDesc, page == PG_BACKUP ? SW_SHOW : SW_HIDE);
     ShowWindow(editRestore, page == PG_RESTORE ? SW_SHOW : SW_HIDE);
     ShowWindow(editExcl, page == PG_EXCLUDES ? SW_SHOW : SW_HIDE);
+    for (HWND e : {editTime, editKeep, editDays}) ShowWindow(e, page == PG_AUTO ? SW_SHOW : SW_HIDE);
+    EnableWindow(editTime, cfg.schedMode != 0);
 }
 static void LayoutControls() {
     RECT cr;
@@ -1885,7 +2466,7 @@ static void LayoutControls() {
     int fh = -(int)lroundf(16 * gs);
     if (fh != editFontH) {
         HFONT f = CreateFontW(fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        for (HWND e : {editFrom, editTo, editDesc, editRestore, editExcl}) SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
+        for (HWND e : {editFrom, editTo, editDesc, editRestore, editExcl, editTime, editKeep, editDays}) SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
         if (editFont) DeleteObject(editFont);
         editFont = f;
         editFontH = fh;
@@ -1896,6 +2477,9 @@ static void LayoutControls() {
     PlaceEdit(editDesc, RC(436, 416, 1074, 468));
     PlaceEdit(editRestore, RC(732, 324, 1076, 348));
     PlaceEdit(editExcl, RC(368, 252, 1080, 656));
+    PlaceEdit(editTime, RC(530, 240, 600, 262));
+    PlaceEdit(editKeep, RC(530, 428, 600, 450));
+    PlaceEdit(editDays, RC(530, 466, 600, 488));
     pageDy = 0;
     ShowControls();
 }
@@ -1946,27 +2530,45 @@ static void Notify(const std::wstring& m) {
     if (job.phase >= 4) job.phase = 0;
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
-static void ResetJob(int kind) {
+static void ResetJob(int kind, const std::wstring& title) {
     if (worker.joinable()) worker.join();
     job.kind = kind;
     job.cancel = false;
-    job.scanned = job.copied = job.linked = job.skipped = job.bytesWritten = job.workDone = job.workTotal = 0;
+    job.scanned = job.copied = job.linked = job.skipped = job.bytesWritten = job.workDone = job.workTotal = job.warnings = 0;
     {
         std::lock_guard l(job.m);
         job.t0 = job.t1 = std::chrono::steady_clock::now();
         job.current.clear();
         job.resultDir.clear();
+        job.title = title;
     }
     job.phase = 1;
-    SetTimer(g_hwnd, T_ANIM, 50, nullptr);
+    if (g_hwnd) SetTimer(g_hwnd, T_ANIM, 50, nullptr);
 }
 static void StartBackup() {
     ReadEdits();
     if (cfg.from.empty() || cfg.to.empty()) { Notify(L"Choose both From and To directories first."); return; }
     SaveSettings();
-    BackupParams p{cfg.from, cfg.to, EditText(editDesc), cfg.full, cfg.hardLinks, cfg.preserve, cfg.versioned, cfg.skipHidden, Patterns(cfg.excludes)};
-    ResetJob(0);
+    BackupParams p{cfg.from, cfg.to, EditText(editDesc), cfg.full, cfg.hardLinks, cfg.preserve, cfg.versioned, cfg.skipHidden, Patterns(cfg.excludes),
+                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays};
+    ResetJob(0, L"Backup " + NormPath(cfg.from) + L" -> " + cfg.to);
     worker = std::thread(BackupWorker, p);
+}
+static void StartVerify() {
+    if (snaps.empty()) return;
+    const Snap& s = snaps[std::clamp(selSnap, 0, (int)snaps.size() - 1)];
+    ResetJob(2, L"Verify " + s.dir);
+    worker = std::thread(VerifyWorker, s.dir, nullptr);
+}
+static void CopyText(const std::wstring& t) {
+    if (!OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    if (HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, (t.size() + 1) * sizeof(wchar_t))) {
+        memcpy(GlobalLock(g), t.c_str(), (t.size() + 1) * sizeof(wchar_t));
+        GlobalUnlock(g);
+        if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g);
+    }
+    CloseClipboard();
 }
 static void StartRestore() {
     if (snaps.empty()) return;
@@ -1976,11 +2578,13 @@ static void StartRestore() {
     std::wstring q = L"Restore the version from " + s.date + L" " + s.time + L" into\n" + target + L"?";
     if (cfg.overwrite) q += L"\n\nExisting files with the same name will be overwritten.";
     if (MessageBoxW(g_hwnd, q.c_str(), L"Entropy Backup", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return;
-    ResetJob(1);
+    ResetJob(1, L"Restore " + s.dir + L" -> " + target);
     worker = std::thread(RestoreWorker, s.dir, target, cfg.overwrite);
 }
 static void GoPage(int p) {
     if (page == PG_EXCLUDES && p != PG_EXCLUDES) { cfg.excludes = EditText(editExcl); SaveSettings(); }
+    if (page == PG_AUTO && p != PG_AUTO) { ReadEdits(); ReadTime(); SaveSettings(); }
+    if (p == PG_AUTO) RefreshTask();
     page = p;
     flash.clear();
     ShowControls();
@@ -2024,7 +2628,9 @@ static void PickColour(UINT32& col) {
 }
 static void OnClick(int id) {
     if (id >= ID_S_STYLE && id < ID_S_STYLE + 6) { cfg.outStyle = id - ID_S_STYLE; SaveSettings(); InvalidateRect(g_hwnd, nullptr, FALSE); return; }
-    if (id >= ID_NAV && id < ID_NAV + 6) { GoPage(id - ID_NAV); return; }
+    if (id >= ID_AU_FREQ && id < ID_AU_FREQ + 4) { cfg.schedMode = id - ID_AU_FREQ; ShowControls(); InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    if (id >= ID_AU_DAY && id < ID_AU_DAY + 7) { cfg.schedDay = id - ID_AU_DAY; InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    if (id >= ID_NAV && id < ID_NAV + (int)PG_COUNT) { GoPage(id - ID_NAV); return; }
     if (id >= ID_CARD && id < ID_LIST) { selSnap = id - ID_CARD; listScroll = selSnap - 3; if (page != PG_RESTORE) GoPage(PG_HISTORY); return; }
     if (id >= ID_LIST) { selSnap = id - ID_LIST; return; }
     switch (id) {
@@ -2053,6 +2659,18 @@ static void OnClick(int id) {
     }
     case ID_H_OPEN: if (!snaps.empty()) OpenFolder(snaps[std::clamp(selSnap, 0, (int)snaps.size() - 1)].dir); break;
     case ID_H_RESTORE: GoPage(PG_RESTORE); break;
+    case ID_H_VERIFY: if (!Running()) StartVerify(); break;
+    case ID_AU_APPLY:
+        ReadEdits();
+        if (cfg.schedMode && !ReadTime()) { flash = L"Enter the time as HH:MM (24-hour)."; break; }
+        SaveSettings();
+        flash = ApplySchedule();
+        RefreshTask();
+        break;
+    case ID_AU_VSS: cfg.shadow = !cfg.shadow; SaveSettings(); break;
+    case ID_AU_SUMS: cfg.checksums = !cfg.checksums; SaveSettings(); break;
+    case ID_AU_VERIFY: cfg.verifyAfter = !cfg.verifyAfter; SaveSettings(); break;
+    case ID_AU_COPY: CopyText(CliCommand(EditText(editFrom), NormPath(EditText(editTo)))); flash = L"Command copied."; break;
     case ID_R_EXPLORE: if (!snaps.empty()) OpenFolder(Join(snaps[std::clamp(selSnap, 0, (int)snaps.size() - 1)].dir, L"files")); break;
     case ID_R_BROWSE: { auto q = PickFolder(g_hwnd, EditText(editRestore)); if (!q.empty()) SetWindowTextW(editRestore, q.c_str()); break; }
     case ID_R_OVERWRITE: cfg.overwrite = !cfg.overwrite; SaveSettings(); break;
@@ -2085,6 +2703,185 @@ static void OnClick(int id) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Command line: scripted and scheduled runs without a window (EntropyBackupCLI.exe, or EntropyBackup.exe <command>)
+// ---------------------------------------------------------------------------------------------
+static HANDLE g_out{};
+static bool g_outConsole = false, g_quiet = false;
+static void Out(const std::wstring& s) {
+    if (g_quiet || !g_out || g_out == INVALID_HANDLE_VALUE) return;
+    DWORD w;
+    if (g_outConsole) WriteConsoleW(g_out, s.c_str(), (DWORD)s.size(), &w, nullptr);
+    else { std::string u = U8(s); WriteFile(g_out, u.data(), (DWORD)u.size(), &w, nullptr); }
+}
+static void OpenOutput() {
+    g_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if ((!g_out || g_out == INVALID_HANDLE_VALUE) && AttachConsole(ATTACH_PARENT_PROCESS))  // the windowed exe started from a console
+        g_out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    DWORD m;
+    g_outConsole = g_out && g_out != INVALID_HANDLE_VALUE && GetConsoleMode(g_out, &m);
+}
+static std::wstring Usage() {
+    return std::wstring(L"Entropy Backup ") + APP_VERSION + LR"( - incremental, versioned project backups
+
+Usage: EntropyBackupCLI <command> [options]
+
+Commands
+  backup          Create a snapshot of --from inside --to
+  verify [ID]     Check a snapshot against its SHA-256 checksums (default: the newest)
+  prune           Apply the retention rules (--keep / --keep-days) now
+  list            List the snapshots in --to
+  help            Show this text
+
+Options (anything not given comes from the app's saved settings)
+  --from DIR      Project folder to back up
+  --to DIR        Backup folder; snapshots go in DIR\EntropyBackup_Versions
+  --desc TEXT     Description stored with the snapshot
+  --full          Full copy instead of incremental      (--incremental to force)
+  --mirror        Keep one mirror_latest instead of versioned snapshots
+  --no-links      Copy unchanged files instead of hard-linking them
+  --exclude PAT   Add an exclude pattern (repeatable)
+  --vss           Copy open files from a Volume Shadow Copy (administrator)  (--no-vss)
+  --checksums     Record SHA-256 checksums                                  (--no-checksums)
+  --verify        Verify the new snapshot after the backup; implies --checksums (--no-verify)
+  --keep N        Keep only the newest N snapshots (0 = all)
+  --keep-days N   Delete snapshots older than N days (0 = never)
+  --log FILE      Append the result to FILE instead of %APPDATA%\EntropyBackup\backup.log
+  --quiet         Print nothing; check the exit code
+
+Exit codes: 0 success, 1 success with warnings, 2 failed, 3 invalid arguments, 4 cancelled
+)";
+}
+static bool IsCliCommand(std::wstring c) {
+    c = Lower(c);
+    while (!c.empty() && (c[0] == L'-' || c[0] == L'/')) c.erase(0, 1);
+    for (auto k : {L"backup", L"verify", L"prune", L"list", L"help", L"h", L"?"}) if (c == k) return true;
+    return false;
+}
+static std::wstring Pad(std::wstring s, size_t n) {
+    if (s.size() > n) s = s.substr(0, n - 1) + L"…";
+    return s + std::wstring(n - s.size(), L' ');
+}
+static BOOL WINAPI OnConsoleCtrl(DWORD) { job.cancel = true; return TRUE; }
+// Waits for the worker, drawing a one-line progress meter when the output is a console.
+static int WaitJob() {
+    while (Running()) {
+        Sleep(200);
+        if (!g_outConsole || g_quiet) continue;
+        uint64_t wt = job.workTotal, wd = job.workDone;
+        int pc = job.phase >= 2 && wt ? (int)std::min<uint64_t>(99, wd * 100 / wt) : 0;
+        std::wstring cur;
+        { std::lock_guard l(job.m); cur = job.current; }
+        wchar_t b[16];
+        swprintf_s(b, L"\r[%3d%%] ", pc);
+        Out(b + Pad(Num(job.scanned) + L" files  " + Bytes(job.bytesWritten) + L"  " + cur, 70));
+    }
+    if (worker.joinable()) worker.join();
+    if (g_outConsole && !g_quiet) Out(L"\r" + std::wstring(78, L' ') + L"\r");
+    std::wstring msg;
+    { std::lock_guard l(job.m); msg = job.message; }
+    Out(msg + L"\n");
+    int ph = job.phase;
+    return ph == 4 ? (job.warnings ? 1 : 0) : ph == 6 ? 4 : 2;
+}
+static int RunCli(const std::vector<std::wstring>& a) {
+    OpenOutput();
+    std::wstring cmd = a.empty() ? L"help" : Lower(a[0]);
+    while (!cmd.empty() && (cmd[0] == L'-' || cmd[0] == L'/')) cmd.erase(0, 1);
+    BackupParams P{cfg.from, cfg.to, L"", cfg.full, cfg.hardLinks, cfg.preserve, cfg.versioned, cfg.skipHidden, Patterns(cfg.excludes),
+                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays};
+    bool scheduled = false;
+    std::wstring snapArg;
+    auto bad = [](const std::wstring& m) { Out(L"Error: " + m + L"\nRun EntropyBackupCLI help for usage.\n"); return 3; };
+    for (size_t i = 1; i < a.size(); i++) {
+        std::wstring o = Lower(a[i]);
+        bool val = i + 1 < a.size();
+        auto num = [&](int& v) {
+            wchar_t* end = nullptr;
+            long n = wcstol(a[++i].c_str(), &end, 10);
+            v = (int)std::clamp(n, 0L, 99999L);
+            return end && !*end && n >= 0;
+        };
+        if (o == L"--from" && val) P.src = a[++i];
+        else if (o == L"--to" && val) P.dst = a[++i];
+        else if ((o == L"--desc" || o == L"--description") && val) P.desc = a[++i];
+        else if (o == L"--exclude" && val) { for (auto& x : Patterns(a[++i])) P.patterns.push_back(x); }
+        else if (o == L"--log" && val) g_logPath = NormPath(a[++i]);
+        else if (o == L"--keep" && val) { if (!num(P.keep)) return bad(L"--keep needs a number."); }
+        else if (o == L"--keep-days" && val) { if (!num(P.keepDays)) return bad(L"--keep-days needs a number."); }
+        else if (o == L"--full") P.full = true;
+        else if (o == L"--incremental") P.full = false;
+        else if (o == L"--mirror") P.versioned = false;
+        else if (o == L"--no-links") P.hardLinks = false;
+        else if (o == L"--vss") P.shadow = true;
+        else if (o == L"--no-vss") P.shadow = false;
+        else if (o == L"--checksums") P.checksums = true;
+        else if (o == L"--no-checksums") P.checksums = P.verify = false;
+        else if (o == L"--verify") P.verify = P.checksums = true;
+        else if (o == L"--no-verify") P.verify = false;
+        else if (o == L"--quiet" || o == L"-q") g_quiet = true;
+        else if (o == L"--scheduled") scheduled = true;
+        else if (o == L"--help" || o == L"-h" || o == L"/?") cmd = L"help";
+        else if (cmd == L"verify" && snapArg.empty() && o[0] != L'-') snapArg = a[i];
+        else return bad(L"unknown or incomplete option " + a[i]);
+    }
+    if (cmd == L"help" || cmd == L"h" || cmd == L"?") { Out(Usage()); return 0; }
+    if (cmd != L"backup" && cmd != L"verify" && cmd != L"prune" && cmd != L"list") return bad(L"unknown command " + a[0]);
+    if (P.dst.empty()) return bad(L"--to is required.");
+    std::wstring dst = NormPath(P.dst), root = Join(dst, L"EntropyBackup_Versions");
+    if (g_outConsole) SetConsoleCtrlHandler(OnConsoleCtrl, TRUE);
+
+    if (cmd == L"backup") {
+        if (P.src.empty()) return bad(L"--from is required.");
+        if (P.desc.empty() && scheduled) P.desc = L"Scheduled backup";
+        std::wstring src = NormPath(P.src);
+        ResetJob(0, (scheduled ? L"Scheduled backup " : L"Backup ") + src + L" -> " + dst);
+        Out(L"Backing up " + src + L" to " + root + L"\n");
+        worker = std::thread(BackupWorker, P);
+        return WaitJob();
+    }
+    if (cmd == L"prune") {
+        if (!P.keep && !P.keepDays) return bad(L"give --keep or --keep-days (or set retention in the app).");
+        try {
+            VersionsLock lock(root);
+            int n = Prune(root, P.keep, P.keepDays);
+            std::wstring msg = L"Removed " + Num(n) + (n == 1 ? L" old snapshot." : L" old snapshots.");
+            LogEvent(L"Prune " + root + L" | OK | " + msg);
+            Out(msg + L"\n");
+            return 0;
+        } catch (const Fail& f) {
+            LogEvent(L"Prune " + root + L" | FAILED | " + f.msg);
+            Out(L"Error: " + f.msg + L"\n");
+            return 2;
+        }
+    }
+    cfg.to = dst;
+    RefreshHistory();
+    if (cmd == L"list") {
+        if (snaps.empty()) { Out(L"No snapshots in " + root + L"\n"); return 0; }
+        Out(Pad(L"ID", 21) + Pad(L"TYPE", 13) + Pad(L"FILES", 10) + Pad(L"SIZE", 11) + Pad(L"CHECKSUMS", 12) + L"DESCRIPTION\n");
+        for (auto& s : snaps) {
+            std::wstring sums = !s.sums ? L"-" : !s.verified ? L"recorded" : s.vBad ? L"PROBLEMS" : L"verified";
+            Out(Pad(s.mirror ? L"mirror_latest" : s.id, 21) + Pad(s.type.empty() ? L"-" : s.type, 13) + Pad(Num(s.files), 10) +
+                Pad(Bytes(s.bytesTotal), 11) + Pad(sums, 12) + s.desc + L"\n");
+        }
+        return 0;
+    }
+    std::wstring dir;  // verify: newest, or the one named by ID, folder name or path
+    for (auto& s : snaps) {
+        std::wstring name = s.dir.substr(s.dir.find_last_of(L'\\') + 1);
+        if (snapArg.empty() || Lower(s.id) == Lower(snapArg) || Lower(name) == Lower(snapArg) || Lower(s.dir) == Lower(NormPath(snapArg))) { dir = s.dir; break; }
+    }
+    if (dir.empty()) { Out(L"Error: no snapshot " + (snapArg.empty() ? L"found in " + root : snapArg) + L"\n"); return 2; }
+    ResetJob(2, L"Verify " + dir);
+    Out(L"Verifying " + dir + L"\n");
+    VerifyResult v;
+    worker = std::thread(VerifyWorker, dir, &v);
+    int rc = WaitJob();
+    for (auto& p : v.problems) Out(L"  " + p + L"\n");
+    return rc;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Window procedure
 // ---------------------------------------------------------------------------------------------
 static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2098,6 +2895,17 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         editDesc = MakeEdit(h, IDC_DESC, ES_MULTILINE | ES_AUTOVSCROLL, nullptr);
         editRestore = MakeEdit(h, IDC_RTARGET, ES_AUTOHSCROLL, L"Select an empty folder to restore into");
         editExcl = MakeEdit(h, IDC_EXCL, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, nullptr);
+        editTime = MakeEdit(h, IDC_TIME, ES_AUTOHSCROLL | ES_CENTER, nullptr);
+        editKeep = MakeEdit(h, IDC_KEEP, ES_AUTOHSCROLL | ES_CENTER | ES_NUMBER, nullptr);
+        editDays = MakeEdit(h, IDC_DAYS, ES_AUTOHSCROLL | ES_CENTER | ES_NUMBER, nullptr);
+        SendMessageW(editTime, EM_SETLIMITTEXT, 5, 0);
+        SendMessageW(editKeep, EM_SETLIMITTEXT, 5, 0);
+        SendMessageW(editDays, EM_SETLIMITTEXT, 5, 0);
+        wchar_t tm[8];
+        swprintf_s(tm, L"%02d:%02d", cfg.schedHour, cfg.schedMin);
+        SetWindowTextW(editTime, tm);
+        SetWindowTextW(editKeep, std::to_wstring(cfg.keepCount).c_str());
+        SetWindowTextW(editDays, std::to_wstring(cfg.keepDays).c_str());
         SendMessageW(editDesc, EM_SETLIMITTEXT, 500, 0);
         SetWindowTextW(editFrom, cfg.from.c_str());
         SetWindowTextW(editTo, cfg.to.c_str());
@@ -2161,6 +2969,13 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         LayoutControls();
         InvalidateRect(h, nullptr, FALSE);
         return 0;
+    case WM_ACTIVATEAPP:  // pick up snapshots made meanwhile by the scheduled task or the command line
+        if (w && !Running()) {
+            RefreshHistory();
+            if (page == PG_AUTO) RefreshTask();
+            InvalidateRect(h, nullptr, FALSE);
+        }
+        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT p;
@@ -2169,9 +2984,11 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &p);
         return 0;
     }
-    case WM_CTLCOLOREDIT: {
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {  // disabled edits ask for the static colours
+        if (m == WM_CTLCOLORSTATIC && (HWND)l != editTime) break;
         HDC dc = (HDC)w;
-        SetTextColor(dc, RGB(236, 241, 247));
+        SetTextColor(dc, m == WM_CTLCOLOREDIT ? RGB(236, 241, 247) : RGB(110, 126, 146));
         SetBkColor(dc, FIELD_GDI);
         return (LRESULT)fieldBrush;
     }
@@ -2180,7 +2997,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(h, nullptr, FALSE);
         if (code == EN_CHANGE) {
             if (id == IDC_TO) SetTimer(h, T_HIST, 450, nullptr);
-            if (id == IDC_EXCL) flash.clear();
+            if (id == IDC_EXCL || id == IDC_TIME) flash.clear();
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
@@ -2255,6 +3072,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (worker.joinable()) worker.join();
         }
         ReadEdits();
+        ReadTime();
         SaveSettings();
         DestroyWindow(h);
         return 0;
@@ -2266,19 +3084,47 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// Start-up shared by the window and the command line.
+static HRESULT InitApp(DWORD coInit) {
+    HRESULT co = CoInitializeEx(nullptr, coInit);
+    // Packet privacy with identify-level impersonation lets the shadow copy writers call back into this process.
+    CoInitializeSecurity(nullptr, -1, nullptr, nullptr, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IDENTIFY, nullptr, EOAC_DYNAMIC_CLOAKING, nullptr);
+    PWSTR p = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) g_appDir = Join(p, L"EntropyBackup");
+    CoTaskMemFree(p);
+    MakeDirs(g_appDir);
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    g_exeDir = exe;
+    g_exeDir = g_exeDir.substr(0, g_exeDir.find_last_of(L'\\'));
+    LoadSettings();
+    return co;
+}
+#ifdef ENTROPY_CLI
+// EntropyBackupCLI.exe: the same program built for the console subsystem, so shells wait for it and get its exit code.
+int wmain(int argc, wchar_t** argv) {
+    HRESULT co = InitApp(COINIT_MULTITHREADED);
+    int rc = RunCli(std::vector<std::wstring>(argv + 1, argv + argc));
+    if (SUCCEEDED(co)) CoUninitialize();
+    return rc;
+}
+#endif
+
 int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-    {
-        PWSTR p = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &p))) g_appDir = Join(p, L"EntropyBackup");
-        CoTaskMemFree(p);
-        MakeDirs(g_appDir);
-        wchar_t exe[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        g_exeDir = exe;
-        g_exeDir = g_exeDir.substr(0, g_exeDir.find_last_of(L'\\'));
+    HRESULT co = InitApp(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    {  // a command (as used by the scheduled task) runs without a window
+        int argc = 0;
+        LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+        std::vector<std::wstring> args;
+        if (argv) args.assign(argv + 1, argv + argc);
+        LocalFree(argv);
+        if (!args.empty() && IsCliCommand(args[0])) {
+            int rc = RunCli(args);
+            if (SUCCEEDED(co)) CoUninitialize();
+            return rc;
+        }
     }
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     LogRuntime(L"Starting Entropy Backup", co);
     HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), reinterpret_cast<void**>(d2f.ReleaseAndGetAddressOf()));
     if (FAILED(hr)) LogRuntime(L"D2D1CreateFactory failed", hr);
@@ -2286,7 +3132,6 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE, LPWSTR, int) {
     if (FAILED(hr)) LogRuntime(L"DWriteCreateFactory failed", hr);
     CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic));
     if (d2f) d2f->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND), nullptr, 0, &roundSt);
-    LoadSettings();
 
     HICON bigIcon = d2f && dwf ? MakeIcon(64) : nullptr, smallIcon = d2f && dwf ? MakeIcon(32) : nullptr;
     WNDCLASSEXW wc{sizeof(wc), CS_HREDRAW | CS_VREDRAW, Wnd, 0, 0, hi, bigIcon ? bigIcon : LoadIcon(nullptr, IDI_APPLICATION), LoadCursor(nullptr, IDC_ARROW),

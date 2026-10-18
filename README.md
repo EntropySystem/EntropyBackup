@@ -20,6 +20,14 @@ Entropy Backup is a simple yet effective native Windows 11 app for incremental, 
 - Locked or unreadable files are skipped and listed instead of failing the whole run.
 - Long paths (`\\?\`) are supported, and junction loops are avoided.
 
+**Automation and integrity** (the Automation page)
+- **Scheduled backups**: hourly, daily or weekly through Windows Task Scheduler, so they also run while the app is closed. Missed runs start as soon as possible, and the page shows the next and last run. The task points at the exe's current location, so save the schedule again if you move it.
+- **Command line and silent mode** for scripts. See [Command line](#command-line).
+- **Open and locked files** are copied from a Volume Shadow Copy when that option is on and the backup runs as administrator. Without administrator rights the backup still runs, reads the live files and reports a warning.
+- **Retention**: keep the newest *N* snapshots and/or delete snapshots older than *N* days. The newest snapshot is always kept, and because unchanged files are hard links, removing a snapshot never touches the others.
+- **SHA-256 checksums** for every file, recorded in the manifest. **Verify** any snapshot from Version History or the command line, or automatically after each backup. Verification reads the files from disk (not the cache) and writes the result to `verify.json`.
+- Every finished backup, verification and prune is appended to `backup.log`. A lock file stops a scheduled run and the app from writing to the same destination at once, and leftovers of interrupted runs are cleaned up.
+
 **Versions and restore**
 - **Version History** panel and page with full details for every snapshot.
 - **Restore** any version into a folder you choose, with an optional overwrite and a confirmation step.
@@ -41,9 +49,39 @@ Entropy Backup is a simple yet effective native Windows 11 app for incremental, 
 
 ## Download
 
-Grab `EntropyBackup.exe` from the [latest release](https://github.com/EntropySystem/EntropyBackup/releases/latest). No installer is needed. Requires Windows 10/11 x64.
+Grab `EntropyBackup.exe` (and `EntropyBackupCLI.exe` for scripts) from the [latest release](https://github.com/EntropySystem/EntropyBackup/releases/latest). No installer is needed. Requires Windows 10/11 x64.
 
 The executable is not code-signed, so Windows SmartScreen may show a warning. You can also build it yourself from source (below).
+
+## Command line
+
+`EntropyBackupCLI.exe` is the same program built for the console, so shells wait for it and get its exit code. `EntropyBackup.exe` accepts the same commands and runs them without a window, which is what the scheduled task uses.
+
+```bat
+EntropyBackupCLI backup --from "C:\Projects\MyApp" --to "E:\Backups" --desc "Nightly"
+EntropyBackupCLI backup --from "C:\Projects\MyApp" --to "E:\Backups" --vss --verify --keep 30
+EntropyBackupCLI verify --to "E:\Backups"                       (newest snapshot)
+EntropyBackupCLI verify 2026-10-18_01-32-05 --to "E:\Backups"
+EntropyBackupCLI prune  --to "E:\Backups" --keep 30 --keep-days 90
+EntropyBackupCLI list   --to "E:\Backups"
+```
+
+Options you don't pass come from the app's saved settings (backup type, excludes, checksums and so on). Run `EntropyBackupCLI help` for the full list.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | Success |
+| 1 | Success with warnings (skipped files, checksum problems, shadow copy unavailable) |
+| 2 | Failed |
+| 3 | Invalid arguments |
+| 4 | Cancelled (Ctrl+C) |
+
+To schedule it with your own tooling instead of the Automation page:
+
+```bat
+schtasks /Create /TN "Nightly project backup" /SC DAILY /ST 02:00 /RL HIGHEST ^
+  /TR "\"C:\Tools\EntropyBackup.exe\" backup --scheduled --from \"C:\Projects\MyApp\" --to \"E:\Backups\" --vss"
+```
 
 ## Build from source
 
@@ -60,7 +98,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-The output is `build\Release\EntropyBackup.exe` (`build.cmd` also copies it to `dist\`).
+The output is `build\Release\EntropyBackup.exe` and `build\Release\EntropyBackupCLI.exe` (`build.cmd` also copies both to `dist\`).
 
 ## Snapshot format
 
@@ -68,14 +106,15 @@ The output is `build\Release\EntropyBackup.exe` (`build.cmd` also copies it to `
 <To>\EntropyBackup_Versions\
     snapshot_2026-10-18_01-32-05\
         files\          complete copy of the project (unchanged files are hard links)
-        manifest.tsv    size, timestamp and path of every file
+        manifest.tsv    size, timestamp, SHA-256 (when enabled) and path of every file
         backup.json     description, source, type, counts, bytes, duration, skipped files
+        verify.json     result of the last verification (if any)
     mirror_latest\      used instead when "Create versioned snapshots" is off
 ```
 
 A snapshot's `files` folder is a plain copy of your project. You can always restore by hand by copying it anywhere.
 
-Settings, excludes and `runtime.log` are stored in `%APPDATA%\EntropyBackup`.
+Settings, excludes, `backup.log` and `runtime.log` are stored in `%APPDATA%\EntropyBackup`.
 
 ## License and disclaimer
 
