@@ -1,9 +1,9 @@
 # Changelog
 
 ## 1.6.1
-- **Code-signed Windows executables.** `EntropyBackup.exe` and `EntropyBackupCLI.exe` are signed through SignPath.io (free code signing for open source, certificate by SignPath Foundation). Windows then shows a verified publisher instead of "Unknown publisher", and they work where policy only allows signed software.
+- **Code signing through SignPath.io is on the way.** The project has applied to the SignPath Foundation open-source program (free code signing, certificate by SignPath Foundation). The release build is ready to sign `EntropyBackup.exe` and `EntropyBackupCLI.exe` once the application is approved. **This release is not signed yet.**
 - Both executables now carry version information (Properties › Details): product name, description, company, version and copyright.
-- The release build signs the executables on GitHub Actions, checks each signature and refuses to publish if signing fails. The README has the code signing policy that SignPath Foundation requires.
+- Once signing is enabled, the release build signs the executables on GitHub Actions, checks each signature and refuses to publish if signing fails. The README has the code signing policy that SignPath Foundation requires.
 
 ## 1.6.0
 Automation and integrity features for IT pros, on a new **Automation** page.

@@ -54,7 +54,7 @@ From the [latest release](https://github.com/EntropySystem/EntropyBackup/release
 - **Windows 10/11 x64:** `EntropyBackup.exe` (and `EntropyBackupCLI.exe` for scripts). No installer is needed.
 - **macOS 14 or later** (including macOS 27, Apple silicon and Intel): `EntropyBackup-macOS.zip`. Unzip it and move *Entropy Backup* to Applications. See [macOS](#macos).
 
-From version 1.6.1 the Windows executables are code-signed (see [Code signing policy](#code-signing-policy)); earlier ones are not, so SmartScreen may warn. The macOS app is not notarized yet, so macOS asks you to allow it once in System Settings › Privacy & Security › **Open Anyway**. You can also build from source (below). Every push is built and tested on GitHub Actions; the downloads of any run are under its *Artifacts*.
+The Windows executables are **not code-signed yet**, so SmartScreen may warn. Code signing through [SignPath.io](https://about.signpath.io) has been applied for (see [Code signing policy](#code-signing-policy)), and releases will be signed once it is approved. The macOS app is not notarized yet, so macOS asks you to allow it once in System Settings › Privacy & Security › **Open Anyway**. You can also build from source (below). Every push is built and tested on GitHub Actions; the downloads of any run are under its *Artifacts*.
 
 ## macOS
 
@@ -137,6 +137,8 @@ A snapshot's `files` folder is a plain copy of your project. You can always rest
 Settings, excludes, `backup.log` and `runtime.log` are stored in `%APPDATA%\EntropyBackup`.
 
 ## Code signing policy
+
+> **Status: pending.** Entropy Backup has applied to the SignPath Foundation open-source program. Until it is approved, the Windows executables are unsigned. The release build is already set up to sign them, and the first release after approval will be signed.
 
 Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
 
