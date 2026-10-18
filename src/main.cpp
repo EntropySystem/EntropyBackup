@@ -860,7 +860,13 @@ static void BackupWorker(BackupParams P) {
         }
 
         SYSTEMTIME now; GetLocalTime(&now);
-        std::wstring id = IdFromTime(now), prev = FindPrevious(root, P.versioned);
+        std::wstring id = IdFromTime(now);
+        while (P.versioned && IsDir(Join(root, L"snapshot_" + id))) {  // IDs have one-second resolution: wait for a free one
+            Sleep(200);
+            GetLocalTime(&now);
+            id = IdFromTime(now);
+        }
+        std::wstring prev = FindPrevious(root, P.versioned);
         work = Join(root, L"incomplete_" + id);
         std::wstring filesDir = Join(work, L"files");
         if (!MakeDirs(filesDir)) throw Fail{L"Cannot write to the backup folder: " + SysMsg(GetLastError())};

@@ -254,7 +254,13 @@ public enum Engine {
         // Leftovers of an interrupted run (power loss, killed process) are never valid snapshots.
         for n in names(root) where n.hasPrefix("incomplete_") { removeTree(join(root, n)) }
 
-        let now = Date(), id = SnapshotID.make(now), prev = findPrevious(root, versioned: o.versioned)
+        var now = Date(), id = SnapshotID.make(now)
+        while o.versioned && isDir(join(root, "snapshot_" + id)) {  // IDs have one-second resolution: wait for a free one
+            usleep(200_000)
+            now = Date()
+            id = SnapshotID.make(now)
+        }
+        let prev = findPrevious(root, versioned: o.versioned)
         work = join(root, "incomplete_" + id)
         let filesDir = join(work, "files")
         try makeDirs(filesDir)
