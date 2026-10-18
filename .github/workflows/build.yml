@@ -42,6 +42,7 @@ jobs:
           & $cli backup --from t\missing --to t\dst; Check 2
           & $cli backup --bogus; Check 3
           Write-Host "All command-line checks passed."
+          exit 0  # otherwise pwsh returns the last tool's exit code (3, from the deliberate bad-argument check)
 
       - uses: actions/upload-artifact@v4
         with:
