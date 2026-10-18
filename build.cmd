@@ -19,7 +19,7 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 
 echo.
 echo ============================================================
-echo   Entropy Backup - Windows 11 x64 Builder v1.5.0
+echo   Entropy Backup - Windows 11 x64 Builder v1.6.0
 echo   Compile verification + persistent diagnostic logs
 echo ============================================================
 echo.
@@ -65,7 +65,9 @@ call :log "      Compiler returned exit code 0."
 
 call :log "[5/6] Verifying compiled executable..."
 set "BUILT_EXE=%BUILDDIR%\Release\EntropyBackup.exe"
+set "BUILT_CLI=%BUILDDIR%\Release\EntropyBackupCLI.exe"
 if not exist "%BUILT_EXE%" goto :missing_exe
+if not exist "%BUILT_CLI%" goto :missing_exe
 for %%F in ("%BUILT_EXE%") do set "EXESIZE=%%~zF"
 if "%EXESIZE%"=="0" goto :missing_exe
 call :log "      Verified: %BUILT_EXE%"
@@ -76,10 +78,13 @@ if not exist "%DISTDIR%" mkdir "%DISTDIR%" >>"%MASTERLOG%" 2>&1
 copy /y "%BUILT_EXE%" "%DISTDIR%\EntropyBackup.exe" >>"%MASTERLOG%" 2>&1
 if errorlevel 1 goto :copy_failed
 if not exist "%DISTDIR%\EntropyBackup.exe" goto :copy_failed
+copy /y "%BUILT_CLI%" "%DISTDIR%\EntropyBackupCLI.exe" >>"%MASTERLOG%" 2>&1
+if errorlevel 1 goto :copy_failed
 
 call :log ""
 call :log "================ BUILD SUCCESS ================"
 call :log "Verified EXE: %DISTDIR%\EntropyBackup.exe"
+call :log "Command line: %DISTDIR%\EntropyBackupCLI.exe"
 call :log "Finished: %date% %time%"
 call :log "==============================================="
 copy /y "%MASTERLOG%" "%LOGDIR%\build-success.log" >nul 2>&1
@@ -90,6 +95,7 @@ echo   BUILD SUCCESS
  echo ============================================================
 echo.
 echo   %DISTDIR%\EntropyBackup.exe
+echo   %DISTDIR%\EntropyBackupCLI.exe
 echo.
 echo The EXE was verified to exist after the compiler finished.
 echo Full log: %MASTERLOG%

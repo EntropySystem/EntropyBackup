@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.6.0
+Automation and integrity features for IT pros, on a new **Automation** page.
+- **Scheduled backups**: Off / Hourly / Daily / Weekly at a chosen time, registered as the Windows Task Scheduler task "Entropy Backup". It runs while you are signed in, even with the app closed, and missed runs start as soon as possible. The page shows the next and last run and its result.
+- **Command line / silent mode**: new `EntropyBackupCLI.exe` with `backup`, `verify`, `prune`, `list` and `help`, plus options for every setting. The exit codes are 0 OK, 1 warnings, 2 failed, 3 invalid arguments and 4 cancelled. `EntropyBackup.exe <command>` does the same without a window. The page shows a ready-to-copy command.
+- **Open and locked files** via the Volume Shadow Copy service (copy-type backup, so other backup tools' history is untouched). This needs administrator rights; without them the backup reads the live files and reports a warning. A schedule with shadow copy on runs with highest privileges.
+- **Retention**: keep the newest N snapshots and/or delete snapshots older than N days, applied after each backup or with `prune`. The newest snapshot is always kept.
+- **SHA-256 checksums** recorded in `manifest.tsv` (v2; v1 manifests still work). **Verify** a snapshot from Version History, after every backup, or with `verify`. Verification reads from disk, bypassing the cache, and saves `verify.json`. History shows the checksum status, and the Type row notes shadow copies.
+- `backup.log` records every finished backup, restore, verification and prune.
+- A lock file in the versions folder stops two backups to the same destination from running at once, and interrupted `incomplete_*` folders are cleaned up on the next run.
+- Fix: two backups started within the same second no longer fail with "Could not finalize the snapshot".
+- Fix: deleting a snapshot (cancel, mirror refresh, retention) no longer clears the read-only flag on hard-linked files that older snapshots share.
+- New slogan: "When Entropy is back UP, launch EntropyBackup!....exe", shown in the README and on the About page.
+- **New: Entropy Backup for macOS** (macOS 14 or later, including macOS 27; universal). It is a native Swift/SwiftUI app with the same features and snapshot format: incremental hard-linked snapshots with APFS clones, history, restore, excludes, scheduled backups through launchd, retention, SHA-256 checksums and verification, and the same command line and exit codes. It uses Liquid Glass on macOS 26 and later. The About page says "....app".
+- GitHub Actions builds and tests both apps on every push (MSVC on Windows, including a real shadow-copy backup; Swift on macOS) and publishes them on a `v*` tag.
+
 ## 1.5.0
 - New **Section Outline** settings: one switch outlines every section with a two-colour gradient.
   - Pick both colours with the Windows colour picker; a swap button and a live preview bar are included.
