@@ -1,0 +1,41 @@
+// Version information shown in Explorer (Properties > Details) and checked by code signing.
+#include <winver.h>
+
+#define EB_VERSION 1,6,1,0
+#define EB_VERSION_STR "1.6.1"
+#ifdef ENTROPY_CLI
+#define EB_DESCRIPTION "Entropy Backup command line"
+#define EB_FILENAME "EntropyBackupCLI.exe"
+#else
+#define EB_DESCRIPTION "Entropy Backup"
+#define EB_FILENAME "EntropyBackup.exe"
+#endif
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION EB_VERSION
+PRODUCTVERSION EB_VERSION
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Entropy Intelligence"
+            VALUE "FileDescription", EB_DESCRIPTION
+            VALUE "FileVersion", EB_VERSION_STR
+            VALUE "InternalName", EB_FILENAME
+            VALUE "LegalCopyright", "Copyright (c) 2026 Entropy Intelligence. MIT License."
+            VALUE "OriginalFilename", EB_FILENAME
+            VALUE "ProductName", "Entropy Backup"
+            VALUE "ProductVersion", EB_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -15,6 +15,15 @@ on:
 jobs:
   windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read  # SignPath downloads the unsigned artifact from this run
+    outputs:
+      signed: ${{ steps.verify.outputs.signed }}
+    env:
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      # Only published builds are signed, so a SignPath approval is needed per release, not per push.
+      RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.release != '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,12 +58,52 @@ jobs:
           Write-Host "All command-line checks passed."
           exit 0  # otherwise pwsh returns the last tool's exit code (3, from the deliberate bad-argument check)
 
+      - name: Collect the executables
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory out | Out-Null
+          Copy-Item build\Release\EntropyBackup.exe, build\Release\EntropyBackupCLI.exe out\
+
+      - uses: actions/upload-artifact@v4
+        id: unsigned
+        with:
+          name: EntropyBackup-windows-x64-unsigned
+          path: out/*.exe
+
+      # Free code signing for open source by SignPath.io, certificate by SignPath Foundation.
+      # Skipped until the SIGNPATH_API_TOKEN secret and the SIGNPATH_ORGANIZATION_ID variable are set.
+      - name: Sign with SignPath
+        if: env.SIGNPATH_API_TOKEN != '' && env.RELEASE == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'EntropyBackup' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600  # leaves time for a manual approval in SignPath
+          output-artifact-directory: signed
+
+      - name: Verify the signatures
+        id: verify
+        if: env.SIGNPATH_API_TOKEN != '' && env.RELEASE == 'true'
+        shell: pwsh
+        run: |
+          foreach ($name in 'EntropyBackup.exe', 'EntropyBackupCLI.exe') {
+            $sig = Get-AuthenticodeSignature "signed\$name"
+            Write-Host "${name}: $($sig.Status) - $($sig.SignerCertificate.Subject)"
+            if ($sig.Status -ne 'Valid') { throw "$name is not validly signed" }
+            Copy-Item "signed\$name" out\ -Force
+          }
+          & out\EntropyBackupCLI.exe help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "the signed CLI does not run" }
+          "signed=true" >> $env:GITHUB_OUTPUT
+
       - uses: actions/upload-artifact@v4
         with:
           name: EntropyBackup-windows-x64
-          path: |
-            build/Release/EntropyBackup.exe
-            build/Release/EntropyBackupCLI.exe
+          path: out/*.exe
 
   macos:
     runs-on: macos-latest
@@ -113,6 +162,7 @@ jobs:
       - name: Release notes from CHANGELOG
         env:
           TAG: ${{ inputs.release || github.ref_name }}
+          SIGNED: ${{ needs.windows.outputs.signed }}
         run: |
           v="${TAG#v}"
           awk -v h="## $v" '$0 == h {f=1; next} /^## / && f {exit} f' CHANGELOG.md > notes.md
@@ -120,8 +170,13 @@ jobs:
           cat >> notes.md <<'NOTES'
 
           **Downloads:** `EntropyBackup.exe` (Windows app), `EntropyBackupCLI.exe` (Windows command line) and `EntropyBackup-macOS.zip` (macOS 14 or later, Apple silicon and Intel).
-          The builds are not code-signed. On Windows, SmartScreen may ask you to confirm. On macOS, open the app once, then allow it in System Settings › Privacy & Security › Open Anyway.
           NOTES
+          if [ "$SIGNED" = "true" ]; then
+            echo "The Windows executables are code-signed (free code signing by SignPath.io, certificate by SignPath Foundation)." >> notes.md
+          else
+            echo "The Windows executables are not code-signed in this release; SmartScreen may ask you to confirm." >> notes.md
+          fi
+          echo "The macOS app is not notarized: open it once, then allow it in System Settings › Privacy & Security › Open Anyway." >> notes.md
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release || github.ref_name }}

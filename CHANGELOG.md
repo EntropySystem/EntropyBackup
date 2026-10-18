@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.6.1
+- **Code signing through SignPath.io is on the way.** The project has applied to the SignPath Foundation open-source program (free code signing, certificate by SignPath Foundation). The release build is ready to sign `EntropyBackup.exe` and `EntropyBackupCLI.exe` once the application is approved. **This release is not signed yet.**
+- Both executables now carry version information (Properties › Details): product name, description, company, version and copyright.
+- Once signing is enabled, the release build signs the executables on GitHub Actions, checks each signature and refuses to publish if signing fails. The README has the code signing policy that SignPath Foundation requires.
+
 ## 1.6.0
 Automation and integrity features for IT pros, on a new **Automation** page.
 - **Scheduled backups**: Off / Hourly / Daily / Weekly at a chosen time, registered as the Windows Task Scheduler task "Entropy Backup". It runs while you are signed in, even with the app closed, and missed runs start as soon as possible. The page shows the next and last run and its result.
