@@ -1,6 +1,6 @@
 import Foundation
 
-public let appVersion = "1.8.0"
+public let appVersion = "1.9.0"
 
 /// Number, size and time formatting shared by the engine, the command line and the app.
 public enum Format {

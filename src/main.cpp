@@ -50,7 +50,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-static const wchar_t* APP_VERSION = L"1.8.0";
+static const wchar_t* APP_VERSION = L"1.9.0";
 static const wchar_t* CLS = L"EntropyBackupGlassWindow";
 static const float DW = 1480.f, DH = 950.f;   // design canvas, scaled uniformly to the window
 static const float PI = 3.14159265f;
@@ -299,7 +299,7 @@ struct Settings {
     int outStyle = 2, outWidth = 30, outGlow = 40;
     // Animated glow: calm effects layered on the outline (bit 0 pulse, 1 flow, 2 shimmer, 3 drift) and their speed.
     bool glowAnim = false;
-    int glowFx = 3, glowSpeed = 30;
+    int glowFx = 3, glowSpeed = 30, flowDir = 0;  // flowDir: 0 clockwise, 1 counter-clockwise (when no job is running)
     // Automation: schedule (0 off, 1 hourly, 2 daily, 3 weekly; day 0 = Sunday), retention (0 = no limit) and integrity.
     int schedMode = 2, schedHour = 2, schedMin = 0, schedDay = 1, keepCount = 0, keepDays = 0;
     bool shadow = false, checksums = false, verifyAfter = false;
@@ -343,6 +343,7 @@ static void LoadSettings() {
     cfg.glowAnim = IniBool(L"GlowAnimate", false);
     cfg.glowFx = std::clamp(iniInt(L"GlowEffects", 3), 1, 15);
     cfg.glowSpeed = std::clamp(iniInt(L"GlowSpeed", 30), 0, 100);
+    cfg.flowDir = std::clamp(iniInt(L"FlowDirection", 0), 0, 1);
     cfg.bgImage = IniGet(L"BackgroundImage", L"");
     cfg.schedMode = std::clamp(iniInt(L"ScheduleMode", 2), 0, 3);
     cfg.schedHour = std::clamp(iniInt(L"ScheduleHour", 2), 0, 23);
@@ -386,6 +387,7 @@ static void SaveSettings() {
     IniSet(L"GlowAnimate", cfg.glowAnim ? L"1" : L"0");
     IniSet(L"GlowEffects", std::to_wstring(cfg.glowFx));
     IniSet(L"GlowSpeed", std::to_wstring(cfg.glowSpeed));
+    IniSet(L"FlowDirection", std::to_wstring(cfg.flowDir));
     IniSet(L"BackgroundImage", cfg.bgImage);
     IniSet(L"ScheduleMode", std::to_wstring(cfg.schedMode));
     IniSet(L"ScheduleHour", std::to_wstring(cfg.schedHour));
@@ -1283,6 +1285,42 @@ static bool IsVideoFile(const std::wstring& f) {
     for (auto x : {L".mp4", L".m4v", L".mov", L".wmv", L".avi", L".mkv"}) if (e == x) return true;
     return false;
 }
+// Built-in backgrounds: three looping videos embedded in the exe (src/backgrounds.rc, made by tools/bggen.cpp).
+// Settings store them as "builtin:N"; on first use each is unpacked to %APPDATA%\EntropyBackup\backgrounds.
+struct Preset { const wchar_t* name; const wchar_t* file; int res; };
+static const Preset PRESETS[3] = {{L"Nebula Lattice", L"nebula-lattice.mp4", 201},
+                                  {L"Tidal Fractal", L"tidal-fractal.mp4", 202},
+                                  {L"Sacred Geometry", L"sacred-geometry.mp4", 203}};
+static int PresetIndex(const std::wstring& bg) {  // 0 = none, 1..3 = built-in video
+    if (bg.rfind(L"builtin:", 0) != 0) return 0;
+    int i = _wtoi(bg.c_str() + 8);
+    return i >= 1 && i <= 3 ? i : 0;
+}
+static std::wstring PresetFile(int i) {
+    const Preset& pr = PRESETS[i - 1];
+    std::wstring dir = Join(g_appDir, L"backgrounds"), f = Join(dir, pr.file);
+    HRSRC r = FindResourceW(nullptr, MAKEINTRESOURCEW(pr.res), MAKEINTRESOURCEW(10));  // RT_RCDATA
+    HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+    const void* data = g ? LockResource(g) : nullptr;
+    DWORD n = r ? SizeofResource(nullptr, r) : 0;
+    if (!data || !n) return {};
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (GetFileAttributesExW(f.c_str(), GetFileExInfoStandard, &a) && a.nFileSizeHigh == 0 && a.nFileSizeLow == n) return f;  // already unpacked
+    MakeDirs(dir);
+    std::wstring tmp = f + L".tmp";
+    HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {};
+    DWORD w = 0;
+    BOOL ok = WriteFile(h, data, n, &w, nullptr) && w == n;
+    CloseHandle(h);
+    if (!ok || !MoveFileExW(tmp.c_str(), f.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(tmp.c_str()); return {}; }
+    return f;
+}
+// The file to show: a custom image or video, or an unpacked built-in video ("" = the built-in mountain scene).
+static std::wstring BackgroundFile() {
+    int i = PresetIndex(cfg.bgImage);
+    return i ? PresetFile(i) : cfg.bgImage;
+}
 class VideoBg {
     std::thread th;
     std::mutex m;
@@ -1880,17 +1918,19 @@ static ComPtr<IWICFormatConverter> LoadWic(const std::wstring& file) {
 static void UpdateFx();
 // Starts or stops the background video to match the settings. Returns why a video cannot be played, or "".
 static std::wstring SyncVideo() {
-    if (!IsVideoFile(cfg.bgImage)) { if (video.Active()) video.Close(); videoBmp.Reset(); return {}; }
-    if (video.Active() && Lower(video.file) == Lower(cfg.bgImage)) return {};
+    std::wstring f = BackgroundFile();
+    if (PresetIndex(cfg.bgImage) && f.empty()) { video.Close(); videoBmp.Reset(); return L"The built-in video could not be unpacked."; }
+    if (!IsVideoFile(f)) { if (video.Active()) video.Close(); videoBmp.Reset(); return {}; }
+    if (video.Active() && Lower(video.file) == Lower(f)) return {};
     videoBmp.Reset();
-    std::wstring why = video.Open(cfg.bgImage);
+    std::wstring why = video.Open(f);
     UpdateFx();
     return why;
 }
 static void LoadImages() {
     bgImageBmp.Reset(); signatureBmp.Reset(); videoBmp.Reset();
     if (!rt) return;
-    if (!IsVideoFile(cfg.bgImage)) if (auto c = LoadWic(cfg.bgImage)) rt->CreateBitmapFromWicBitmap(c.Get(), &bgImageBmp);
+    if (!PresetIndex(cfg.bgImage) && !IsVideoFile(cfg.bgImage)) if (auto c = LoadWic(cfg.bgImage)) rt->CreateBitmapFromWicBitmap(c.Get(), &bgImageBmp);
     for (auto& dir : {g_exeDir, g_appDir})
         if (!signatureBmp) if (auto c = LoadWic(Join(dir, L"signature.png"))) rt->CreateBitmapFromWicBitmap(c.Get(), &signatureBmp);
     bgDirty = true;
@@ -2075,8 +2115,8 @@ enum Id {
     ID_S_REMEMBER, ID_S_HIDDEN, ID_S_BG_PICK, ID_S_BG_RESET, ID_S_BANNER, ID_S_TINT, ID_S_FROST, ID_S_LOOK_RESET, ID_S_OPENDIR, ID_X_DEFAULTS, ID_X_SAVE, ID_A_DATA,
     ID_CAP_MIN, ID_CAP_MAX, ID_CAP_CLOSE, ID_S_OUTLINE, ID_S_COLA, ID_S_COLB, ID_S_SWAP, ID_S_SPAN, ID_S_OWIDTH, ID_S_OGLOW,
     ID_H_VERIFY, ID_AU_APPLY, ID_AU_VSS, ID_AU_SUMS, ID_AU_VERIFY, ID_AU_COPY, ID_CHK_FIRE, ID_BROWSE_FIRE, ID_VIEW_PRIMARY, ID_VIEW_FIRE,
-    ID_S_GLOWANIM, ID_S_GSPEED,
-    ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_S_FX = 940, ID_CARD = 1000, ID_LIST = 3000
+    ID_S_GLOWANIM, ID_S_GSPEED, ID_S_CW, ID_S_CCW,
+    ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_S_FX = 940, ID_S_BGPRE = 950, ID_CARD = 1000, ID_LIST = 3000
 };
 enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL, IDC_TIME, IDC_KEEP, IDC_DAYS, IDC_FIRE };
 static int page = PG_BACKUP, hoverId = 0, pressId = 0, dragId = 0;
@@ -2141,23 +2181,17 @@ static void Glass(D2D1_RECT_F r, float rad, bool gold) {
         auto wave = [&](float period) { return 0.5f - 0.5f * cosf(T * 2 * PI / period); };  // 0..1, starts at 0
         if (fx & FX_DRIFT) { float k = wave(12); D2D1_COLOR_F a0 = a; a = Mix(a, z, k); z = Mix(z, a0, k); }
         float pulse = fx & FX_PULSE ? 1 - 0.65f * wave(4.5f) : 1.f;
-        float rot = fx & FX_FLOW ? fmodf(T * 2 * PI / 10, 2 * PI) : 0.f;
         float mx = (b.left + b.right) / 2, my = (b.top + b.bottom) / 2;
-        auto turn = [&](D2D1_POINT_2F q) {  // Flow: the gradient axis turns slowly around the box centre
-            float dx = q.x - mx, dy = q.y - my, c = cosf(rot), sn = sinf(rot);
-            return P2(mx + dx * c - dy * sn, my + dx * sn + dy * c);
-        };
-        ComPtr<ID2D1Brush> br;
+        ComPtr<ID2D1Brush> br;  // Flow is drawn once around the window edge (DrawEdgeFlow), not per section
         switch (cfg.outStyle) {
-        case 0: br = LG(turn(P2(b.left, my)), turn(P2(b.right, my)), {{0, a}, {1, z}}); break;                         // horizontal
-        case 1: br = LG(turn(P2(mx, b.top)), turn(P2(mx, b.bottom)), {{0, a}, {1, z}}); break;                         // vertical
-        case 2: br = LG(turn(P2(b.left, b.top)), turn(P2(b.right, b.bottom)), {{0, a}, {1, z}}); break;                // diagonal
-        case 3: br = LG(turn(P2(b.left, b.bottom)), turn(P2(b.right, b.top)), {{0, a}, {1, z}}); break;                // reverse diagonal
-        case 4: br = LG(turn(P2(b.left, b.top)), turn(P2(b.right, b.bottom)), {{0, a}, {0.5f, z}, {1, a}}); break;     // mirror A-B-A
-        default: {                                                                                                     // radial glow from centre
+        case 0: br = LG(P2(b.left, my), P2(b.right, my), {{0, a}, {1, z}}); break;                       // horizontal
+        case 1: br = LG(P2(mx, b.top), P2(mx, b.bottom), {{0, a}, {1, z}}); break;                       // vertical
+        case 2: br = LG(P2(b.left, b.top), P2(b.right, b.bottom), {{0, a}, {1, z}}); break;              // diagonal
+        case 3: br = LG(P2(b.left, b.bottom), P2(b.right, b.top), {{0, a}, {1, z}}); break;              // reverse diagonal
+        case 4: br = LG(P2(b.left, b.top), P2(b.right, b.bottom), {{0, a}, {0.5f, z}, {1, a}}); break;   // mirror A-B-A
+        default: {                                                                                       // radial glow from centre
             float rr = sqrtf((b.right - b.left) * (b.right - b.left) + (b.bottom - b.top) * (b.bottom - b.top)) / 2;
-            float off = fx & FX_FLOW ? std::min(b.right - b.left, b.bottom - b.top) * 0.25f : 0.f;  // Flow: the centre circles
-            br = RG(P2(mx + off * cosf(rot), my + off * sinf(rot)), rr, rr, {{0, a}, {0.55f, a}, {1, z}});
+            br = RG(P2(mx, my), rr, rr, {{0, a}, {0.55f, a}, {1, z}});
         }
         }
         if (glow > 0)
@@ -2558,14 +2592,17 @@ static void DrawSettingsPage() {
     Slider(ID_S_TINT, 520, 294, 380, L"Glass tint", cfg.tint);
     Slider(ID_S_FROST, 520, 324, 380, L"Frost (blur)", cfg.frost);
     Check(ID_S_BANNER, 362, 354, L"Show page header banner  (alternate layout for A/B testing)", cfg.banner, true, 16);
-    Text(L"Background", RC(362, 372, 520, 394), 15, C(0x93A7BD));
-    std::wstring bgName = cfg.bgImage.empty() ? L"Built-in mountain dusk"
+    // Built-in backgrounds (the mountain scene and three looping videos), or a custom image or video
+    Text(L"Background", RC(362, 372, 520, 398), 15, C(0xDCE4EE));
+    int pre = PresetIndex(cfg.bgImage);
+    static const wchar_t* bgs[4] = {L"Mountain Dusk", L"Nebula Lattice", L"Tidal Fractal", L"Sacred Geometry"};
+    for (int i = 0; i < 4; i++) Chip(ID_S_BGPRE + i, RC(520 + i * 142.f, 370, 656 + i * 142.f, 398), bgs[i], i == 0 ? cfg.bgImage.empty() : pre == i, true);
+    Button(ID_S_BG_PICK, RC(360, 406, 588, 438), L"Choose Image or Video...", BS_SECOND, IC_FOLDER, false, true, 15);
+    std::wstring bgName = cfg.bgImage.empty() || pre ? (pre && !video.Active() ? L"This video cannot be played; showing the mountain scene." : L"")
                         : cfg.bgImage.substr(cfg.bgImage.find_last_of(L"\\/") + 1) + (!IsVideoFile(cfg.bgImage) ? L""
-                           : video.Active() ? L"   \u00B7  video, looping and muted" : L"   \u00B7  cannot be played, showing the built-in scene");
-    Text(bgName, RC(520, 372, 1088, 394), 15, C(0xE8EEF5));
-    Button(ID_S_BG_PICK, RC(360, 398, 588, 434), L"Choose Image or Video...", BS_SECOND, IC_FOLDER, false, true, 15);
-    Button(ID_S_BG_RESET, RC(600, 398, 812, 434), L"Use Built-in Scene", BS_GHOST, IC_NONE, false, !cfg.bgImage.empty(), 15);
-    Button(ID_S_LOOK_RESET, RC(824, 398, 1088, 434), L"Reset Glass Look", BS_GHOST, IC_RESTORE, false, cfg.tint != 55 || cfg.frost != 100, 15);
+                           : video.Active() ? L"  \u00B7  looping video" : L"  \u00B7  cannot be played");
+    Text(bgName, RC(600, 406, 816, 438), 13.5f, C(0xE8EEF5));
+    Button(ID_S_LOOK_RESET, RC(824, 406, 1088, 438), L"Reset Glass Look", BS_GHOST, IC_RESTORE, false, cfg.tint != 55 || cfg.frost != 100, 15);
     Line(360, 446, 1088, 446, sep, 1);
 
     Text(L"Section Outline", RC(360, 452, 800, 482), 18, gold, SEMI);
@@ -2591,8 +2628,11 @@ static void DrawSettingsPage() {
     Check(ID_S_GLOWANIM, 362, 668, L"Animate", cfg.glowAnim, en, 15);
     static const wchar_t* fxNames[4] = {L"Pulse", L"Flow", L"Shimmer", L"Drift"};
     for (int i = 0; i < 4; i++) Chip(ID_S_FX + i, RC(520 + i * 95.f, 654, 609 + i * 95.f, 682), fxNames[i], (cfg.glowFx >> i) & 1, an);
-    Text(an ? L"Calm effects; pick any mix." : L"", RC(904, 654, 1088, 682), 12.5f, C(0x9CB0C5));
+    bool fl = an && (cfg.glowFx & FX_FLOW);  // Flow travels the window edge: pick its resting direction
+    Chip(ID_S_CW, RC(904, 654, 994, 682), L"\u21BB CW", cfg.flowDir == 0, fl);
+    Chip(ID_S_CCW, RC(998, 654, 1088, 682), L"\u21BA CCW", cfg.flowDir == 1, fl);
     Slider(ID_S_GSPEED, 520, 708, 380, L"Speed", cfg.glowSpeed, an);
+    if (fl) Text(L"Backup \u21BB   Restore \u21BA", RC(958, 696, 1090, 720), 12.f, C(0x9CB0C5), REG, RIGHT);
 }
 static void DrawExcludesPage() {
     Glass(PagePanel(), 22, false);
@@ -2751,6 +2791,50 @@ static void DrawQuickBackupPanel() {
     static const wchar_t* busy[3] = {L"Backing Up...", L"Restoring...", L"Verifying..."};
     Button(ID_BACKUP, RC(1146, by, 1446, by + 52), run ? busy[std::clamp((int)job.kind, 0, 2)] : L"Back Up Now", BS_PRIMARY, IC_DB, !run, !run, 18);
 }
+// Flow: one soft comet of light travels around the edge of the window. It also says what the app is doing:
+// clockwise while backing up, counter-clockwise while restoring, otherwise the direction chosen in Settings.
+// A change of direction eases through a stop rather than jumping.
+static double g_flowPos = 0, g_flowVel = 0;  // position along the edge (0..1, clockwise) and speed (loops per second)
+static std::chrono::steady_clock::time_point g_flowT{};
+static int FlowDirection() {
+    if (Running() && job.kind == 0) return 1;
+    if (Running() && job.kind == 1) return -1;
+    return cfg.flowDir ? -1 : 1;
+}
+static void DrawEdgeFlow(float cw, float ch) {
+    auto now = std::chrono::steady_clock::now();
+    double dt = g_flowT.time_since_epoch().count() ? std::min(0.1, std::chrono::duration<double>(now - g_flowT).count()) : 0.0;
+    g_flowT = now;
+    if (!cfg.outline || !cfg.glowAnim || !(cfg.glowFx & FX_FLOW)) { g_flowVel = 0; return; }
+    double speed = (0.25 + cfg.glowSpeed / 100.0 * 1.75) / 16.0, target = FlowDirection() * speed;  // one lap in 16 s at 1x
+    if (g_flowVel == 0) g_flowVel = target * 1e-3;  // just switched on: ease in from a standstill
+    g_flowVel += (target - g_flowVel) * std::min(1.0, dt * 1.6);
+    g_flowPos = fmod(g_flowPos + g_flowVel * dt + 2.0, 1.0);
+    bool maxed = IsZoomed(g_hwnd);
+    float k = std::max(0.8f, gs), in = 1.f * k, rad = maxed ? 0.f : 8.f;
+    auto edge = RC(in, in, cw - in, ch - in);
+    float pw = edge.right - edge.left, ph = edge.bottom - edge.top, per = 2 * (pw + ph);
+    auto at = [&](double u) {  // point on the edge, clockwise from the top-left corner
+        float d = (float)(fmod(u + 2.0, 1.0) * per);
+        return d < pw ? P2(edge.left + d, edge.top) : d < pw + ph ? P2(edge.right, edge.top + d - pw)
+             : d < 2 * pw + ph ? P2(edge.right - (d - pw - ph), edge.bottom) : P2(edge.left, edge.bottom - (d - 2 * pw - ph));
+    };
+    float glow = cfg.outGlow / 100.f, move = (float)std::min(1.0, fabs(g_flowVel) / speed);
+    int dir = g_flowVel >= 0 ? 1 : -1;
+    const int N = 16;
+    float tail = 0.11f * move;  // the tail shrinks to nothing while the comet turns around
+    for (int i = N; i >= 0; i--) {
+        float f = (float)i / N, fade = (1 - f) * (1 - f);
+        D2D1_COLOR_F c = Mix(Mix(C(cfg.outA), C(cfg.outB), f), C(0xFFFFFF), 0.25f * (1 - f)), c0 = c;
+        c0.a = 0;
+        float r = (110 - 50 * f) * k;
+        auto br = RG(at(g_flowPos - dir * f * tail), r, r, {{0, c}, {1, c0}});
+        br->SetOpacity(fade * (0.18f + 0.30f * glow));
+        StrokeRR(edge, rad, br.Get(), (5 + 12 * glow) * k);
+        br->SetOpacity(fade * 0.95f);
+        StrokeRR(edge, rad, br.Get(), 1.8f * k);
+    }
+}
 static void DrawCaption(float cw) {
     float k = std::max(0.8f, gs), bw = 46 * k, bh = 34 * k, x = cw - 3 * bw;
     for (int i = 0; i < 3; i++) {
@@ -2840,6 +2924,7 @@ static void Paint() {
     DrawHistoryPanel();
     DrawQuickBackupPanel();
     rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    DrawEdgeFlow(z.width, z.height);
     DrawCaption(z.width);
     HRESULT hr = rt->EndDraw();
     if (hr == D2DERR_RECREATE_TARGET) {
@@ -3082,6 +3167,16 @@ static void PickColour(UINT32& col) {
 }
 static void OnClick(int id) {
     if (id >= ID_S_STYLE && id < ID_S_STYLE + 6) { cfg.outStyle = id - ID_S_STYLE; SaveSettings(); InvalidateRect(g_hwnd, nullptr, FALSE); return; }
+    if (id >= ID_S_BGPRE && id < ID_S_BGPRE + 4) {  // Mountain Dusk, or one of the built-in videos
+        std::wstring old = cfg.bgImage;
+        cfg.bgImage = id == ID_S_BGPRE ? L"" : L"builtin:" + std::to_wstring(id - ID_S_BGPRE);
+        std::wstring why = SyncVideo();
+        if (!why.empty()) { cfg.bgImage = old; SyncVideo(); flash = why; }
+        else { SaveSettings(); flash = id == ID_S_BGPRE ? L"Built-in scene restored." : std::wstring(PRESETS[id - ID_S_BGPRE - 1].name) + L" playing."; }
+        LoadImages();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
+    }
     if (id >= ID_S_FX && id < ID_S_FX + 4) {  // effects combine; at least one stays on
         int v = cfg.glowFx ^ (1 << (id - ID_S_FX));
         if (v) { cfg.glowFx = v; SaveSettings(); }
@@ -3177,6 +3272,8 @@ static void OnClick(int id) {
     case ID_S_BANNER: cfg.banner = !cfg.banner; SaveSettings(); LayoutControls(); break;
     case ID_S_OUTLINE: cfg.outline = !cfg.outline; SaveSettings(); UpdateFx(); break;
     case ID_S_GLOWANIM: cfg.glowAnim = !cfg.glowAnim; SaveSettings(); UpdateFx(); break;
+    case ID_S_CW: cfg.flowDir = 0; SaveSettings(); break;
+    case ID_S_CCW: cfg.flowDir = 1; SaveSettings(); break;
     case ID_S_SPAN: cfg.outSpan = !cfg.outSpan; SaveSettings(); break;
     case ID_S_COLA: PickColour(cfg.outA); SaveSettings(); break;
     case ID_S_COLB: PickColour(cfg.outB); SaveSettings(); break;

@@ -1,0 +1,5 @@
+// Built-in background videos, made by tools/make-backgrounds.cmd. Only the windowed app embeds them.
+// CMake fills in the absolute folder, so rc.exe finds the files from any build directory.
+201 RCDATA "@EB_BACKGROUNDS@/nebula-lattice.mp4"
+202 RCDATA "@EB_BACKGROUNDS@/tidal-fractal.mp4"
+203 RCDATA "@EB_BACKGROUNDS@/sacred-geometry.mp4"

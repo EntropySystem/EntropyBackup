@@ -19,7 +19,7 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 
 echo.
 echo ============================================================
-echo   Entropy Backup - Windows 11 x64 Builder v1.8.0
+echo   Entropy Backup - Windows 11 x64 Builder v1.9.0
 echo   Compile verification + persistent diagnostic logs
 echo ============================================================
 echo.

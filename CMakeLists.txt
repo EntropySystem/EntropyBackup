@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.24)
-project(EntropyBackup VERSION 1.8.0 LANGUAGES CXX)
+project(EntropyBackup VERSION 1.9.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # EntropyBackup.exe is the windowed app; EntropyBackupCLI.exe is the same source built for the console,
 # so scripts and shells wait for it and get its exit code.
-add_executable(EntropyBackup WIN32 src/main.cpp src/version.rc)
+set(EB_BACKGROUNDS "${CMAKE_SOURCE_DIR}/assets/backgrounds")
+configure_file(src/backgrounds.rc.in ${CMAKE_BINARY_DIR}/backgrounds.rc @ONLY)
+add_executable(EntropyBackup WIN32 src/main.cpp src/version.rc ${CMAKE_BINARY_DIR}/backgrounds.rc)
 add_executable(EntropyBackupCLI src/main.cpp src/version.rc)
 target_compile_definitions(EntropyBackupCLI PRIVATE ENTROPY_CLI)
 foreach(t EntropyBackup EntropyBackupCLI)
@@ -15,3 +17,8 @@ foreach(t EntropyBackup EntropyBackupCLI)
     set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
   endif()
 endforeach()
+# Generator for the built-in background videos (not part of the normal build): tools/make-backgrounds.cmd
+add_executable(bggen EXCLUDE_FROM_ALL tools/bggen.cpp)
+if(MSVC)
+  target_compile_options(bggen PRIVATE /O2 /fp:fast /W4 /utf-8)
+endif()

@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.0
+**The glow now shows what the app is doing** (Windows app).
+- **Flow travels the edge of the window:** one soft comet of light circles the whole app, instead of the gradient turning on every section, which was too busy. Section outlines stay still; Pulse, Shimmer and Drift still apply to them.
+- **Direction tells you what is happening:** **clockwise while backing up**, **counter-clockwise while restoring**. The rest of the time it follows your choice of the new **↻ CW** / **↺ CCW** chips. When the direction changes, the comet slows down, turns and speeds back up smoothly.
+- **Three built-in background videos:** **Nebula Lattice** (a kaleidoscopic hex lattice turning through a soft nebula), **Tidal Fractal** (domain-warped fractal noise drifting like ink in water) and **Sacred Geometry** (flower-of-life linework and nested polygons turning slowly). Each is a dark, calm, seamless 20-second loop in the app's navy, teal and gold.
+  - They are embedded in `EntropyBackup.exe` (about 7 MB) and unpacked to `%APPDATA%\EntropyBackup\backgrounds` the first time you use one.
+  - They are rendered by `tools/bggen.cpp` and encoded by `tools/make-backgrounds.cmd` (ffmpeg), so anyone can rebuild them.
+- **Settings › Background** now has chips: **Mountain Dusk** (the still default) | **Nebula Lattice** | **Tidal Fractal** | **Sacred Geometry**. **Choose Image or Video...** still takes your own files.
+
 ## 1.8.0
 **Living glass:** an animated outline glow and video backgrounds (Windows app).
 - **Animated glow** (Settings › Section Outline › **Animate**): calm effects that you can combine, plus a **Speed** slider. They are kept slow on purpose, so they never pull attention from a backup.
