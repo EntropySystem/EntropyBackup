@@ -6,7 +6,7 @@ public struct Snapshot: Identifiable, Hashable {
     public var files = 0, copied = 0, reused = 0, failed = 0
     public var bytes: Int64 = 0, bytesTotal: Int64 = 0
     public var seconds = 0.0
-    public var mirror = false, sums = false, verified = false
+    public var mirror = false, sums = false, verified = false, firebox = false
     public var vChecked = 0, vBad = 0, vWhen = ""
     public var id: String { dir }
     public var name: String { (dir as NSString).lastPathComponent }
@@ -33,6 +33,7 @@ public struct Snapshot: Identifiable, Hashable {
             s.bytesTotal = (j["bytes_total"] as? NSNumber)?.int64Value ?? 0
             s.seconds = (j["duration_seconds"] as? NSNumber)?.doubleValue ?? 0
             s.sums = j["checksums"] as? Bool ?? false
+            s.firebox = j["firebox"] as? Bool ?? false
             let iso = (j["created_iso"] as? String ?? "").replacingOccurrences(of: "T", with: "_").replacingOccurrences(of: ":", with: "-")
             s.sid = isSnap ? String(n.dropFirst(9)) : (iso.isEmpty ? "0000-00-00_00-00-00" : iso)
             (s.date, s.time) = SnapshotID.display(s.sid)

@@ -12,6 +12,8 @@ public struct Settings: Codable, Equatable {
     public var schedMode = 2, schedHour = 2, schedMin = 0, schedDay = 1
     public var keepCount = 0, keepDays = 0
     public var checksums = true, verifyAfter = false
+    // Firebox mode: every backup also goes to a second, independent destination (ideally off-site).
+    public var fireOn = false, fire = ""
 
     public init() {}
 
@@ -34,7 +36,7 @@ public struct Settings: Codable, Equatable {
     }
     public func save() {
         var s = self
-        if !remember { s.from = ""; s.to = "" }
+        if !remember { s.from = ""; s.to = ""; s.fire = "" }
         try? FileManager.default.createDirectory(atPath: Settings.directory, withIntermediateDirectories: true)
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]

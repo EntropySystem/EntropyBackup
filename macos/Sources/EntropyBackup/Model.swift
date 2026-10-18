@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     @Published var restoreTarget = ""
     @Published var schedule = Schedule.Status()
     @Published var flash = ""
+    @Published var viewFire = false  // History and Restore list the Firebox instead of the backup folder
     private var job: Job?
     private var timer: Timer?
 
@@ -23,10 +24,19 @@ final class AppModel: ObservableObject {
 
     var running: Bool { state.running }
     var current: Snapshot? { snapshots.first { $0.dir == selected } }
+    var fireboxSet: Bool { settings.fireOn && !settings.fire.isEmpty }
+    var viewDest: String { viewFire && fireboxSet ? settings.fire : settings.to }
+    /// Warning for the Firebox row: an invalid pair, or a Firebox on the same drive as the backup folder.
+    var fireNote: String {
+        guard fireboxSet, !settings.to.isEmpty else { return "" }
+        if let why = Engine.fireboxConflict(settings.to, settings.fire) { return why }
+        return Engine.sameVolume(settings.to, settings.fire) ? "Same drive as To \u{2014} not a real second copy" : ""
+    }
     var executable: String { Bundle.main.executablePath ?? CommandLine.arguments[0] }
 
     func refresh() {
-        snapshots = Snapshot.list(settings.to)
+        if !fireboxSet { viewFire = false }
+        snapshots = Snapshot.list(viewDest)
         if selected == nil || !snapshots.contains(where: { $0.dir == selected }) { selected = snapshots.first?.dir }
     }
 
@@ -59,8 +69,10 @@ final class AppModel: ObservableObject {
     func backup() {
         guard !running else { return }
         guard !settings.from.isEmpty, !settings.to.isEmpty else { state.message = "Choose both From and To folders first."; return }
+        if settings.fireOn && settings.fire.isEmpty { state.message = "Choose a Firebox folder, or turn Firebox mode off."; return }
         let o = BackupOptions(settings, desc: desc)
-        let job = Job(.backup, title: "Backup \(normPath(o.src)) -> \(normPath(o.dst))")
+        if !o.fire.isEmpty, let why = Engine.fireboxConflict(o.dst, o.fire) { state.message = why; return }
+        let job = Job(.backup, title: "Backup \(normPath(o.src)) -> \(normPath(o.dst))" + (o.fire.isEmpty ? "" : " + Firebox \(normPath(o.fire))"))
         start(job) { Engine.backup(o, job: job) }
     }
     func restore() {
@@ -84,6 +96,7 @@ final class AppModel: ObservableObject {
         let q = { (s: String) in "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
         return q(executable) + " backup --from " + q(settings.from.isEmpty ? "<project folder>" : settings.from)
             + " --to " + q(settings.to.isEmpty ? "<backup folder>" : settings.to)
+            + (fireboxSet ? " --firebox " + q(settings.fire) : "")
     }
     func copyCommand() {
         NSPasteboard.general.clearContents()

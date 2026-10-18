@@ -53,6 +53,14 @@ jobs:
           if ((Get-ChildItem t\dst\EntropyBackup_Versions -Directory -Filter "snapshot_*").Count -ne 2) { throw "retention did not keep 2 snapshots" }
           Set-Content "$($snap.FullName)\files\a.txt" "corrupted"
           & $cli verify --to t\dst; Check 1
+          # Firebox mode: a second, independent snapshot chain; an unreachable destination still saves the other one.
+          & $cli backup --from t\src --to t\dst2 --firebox t\fire --verify --desc "Firebox"; Check 0
+          $fb = @(Get-ChildItem t\fire\EntropyBackup_Versions -Directory -Filter "snapshot_*")
+          if ($fb.Count -ne 1) { throw "the Firebox snapshot is missing" }
+          if (-not (Select-String -Path "$($fb[0].FullName)\backup.json" -Pattern '"firebox": true' -Quiet)) { throw "the Firebox snapshot is not tagged" }
+          & $cli backup --from t\src --to t\dst2 --firebox t\src\a.txt\fire; Check 1
+          if ((Get-ChildItem t\dst2\EntropyBackup_Versions -Directory -Filter "snapshot_*").Count -ne 2) { throw "the primary was not saved when the Firebox failed" }
+          & $cli backup --from t\src --to t\dst2 --firebox t\dst2; Check 3
           & $cli backup --from t\missing --to t\dst; Check 2
           & $cli backup --bogus; Check 3
           Write-Host "All command-line checks passed."
@@ -137,6 +145,11 @@ jobs:
           snap=$(ls -d "$t"/dst/EntropyBackup_Versions/snapshot_* | tail -1)
           echo corrupted > "$snap/files/sub/b.txt"
           check 1 "$app" verify --to "$t/dst"
+          check 0 "$app" backup --from "$t/src" --to "$t/dst2" --firebox "$t/fire" --verify
+          [ "$(ls -d "$t"/fire/EntropyBackup_Versions/snapshot_* | wc -l)" -eq 1 ] || { echo "::error::the Firebox snapshot is missing"; exit 1; }
+          sleep 1; check 1 "$app" backup --from "$t/src" --to "$t/dst2" --firebox "$t/src/a.txt/fire"
+          [ "$(ls -d "$t"/dst2/EntropyBackup_Versions/snapshot_* | wc -l)" -eq 2 ] || { echo "::error::the primary was not saved when the Firebox failed"; exit 1; }
+          check 3 "$app" backup --from "$t/src" --to "$t/dst2" --firebox "$t/dst2"
           check 2 "$app" backup --from "$t/missing" --to "$t/dst"
           check 3 "$app" backup --bogus
           echo "All command-line checks passed."

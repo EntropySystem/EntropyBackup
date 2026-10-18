@@ -10,6 +10,17 @@ Entropy Backup is a simple yet effective native app for incremental, versioned p
 
 ## Features
 
+**Firebox mode: no single point of failure** 🔥
+- Even a RAID NAS is still *one* machine in *one* place. Turn on **Firebox mode** (on the Backup page, next to *To*) and every backup also goes to a **Firebox**: a second location such as another drive, a second NAS or an off-site share. The name comes from the fireproof boxes that backups used to be stored in, off site, in case the building burned down.
+- The two copies are **independent**: each destination gets its own complete snapshot chain, read straight from your project and never copied from the other. Losing or corrupting either one does not affect the other.
+- On Windows both are made from **one scan** (and one shadow copy, when that is on), so they capture the same moment and each file is hashed only once. The macOS app backs up to the primary first, then to the Firebox.
+- If one destination can't be reached (an unplugged drive, an offline NAS), the other is **still saved**. The status panel shows it in red, `backup.log` records it, and scheduled or scripted runs exit with code 1.
+- Version History and Restore have a **Primary | Firebox** switch, so if the primary is gone you can browse, verify and restore straight from the Firebox.
+- The app warns you if the Firebox is on the same drive as the backup folder, because then it is not a real second copy.
+- Scheduled backups, retention and the command line (`--firebox DIR`) all include the Firebox.
+
+![Firebox history](docs/screenshots/firebox.png)
+
 **Backups**
 - **From → To → Description → Back Up Now.** That's the whole workflow. The Back Up Now button lives in the bottom-right panel on every page.
 - **Incremental** or **Full Copy** snapshots. Every snapshot is a complete, browsable copy of your project.
@@ -69,6 +80,7 @@ The macOS app (in [`macos/`](macos)) is a native Swift/SwiftUI app with the same
 ```sh
 alias entropybackup="/Applications/Entropy Backup.app/Contents/MacOS/EntropyBackup"
 entropybackup backup --from ~/Projects/MyApp --to /Volumes/Backup --verify --keep 30
+entropybackup backup --from ~/Projects/MyApp --to /Volumes/Backup --firebox /Volumes/Offsite/MyApp
 ```
 
 Build it with Xcode 15 or later: `cd macos && swift test && scripts/make-app.sh` (output in `macos/dist/`).
@@ -80,6 +92,7 @@ Build it with Xcode 15 or later: `cd macos && swift test && scripts/make-app.sh`
 ```bat
 EntropyBackupCLI backup --from "C:\Projects\MyApp" --to "E:\Backups" --desc "Nightly"
 EntropyBackupCLI backup --from "C:\Projects\MyApp" --to "E:\Backups" --vss --verify --keep 30
+EntropyBackupCLI backup --from "C:\Projects\MyApp" --to "E:\Backups" --firebox "\\NAS\Offsite\MyApp"
 EntropyBackupCLI verify --to "E:\Backups"                       (newest snapshot)
 EntropyBackupCLI verify 2026-10-18_01-32-05 --to "E:\Backups"
 EntropyBackupCLI prune  --to "E:\Backups" --keep 30 --keep-days 90
@@ -91,7 +104,7 @@ Options you don't pass come from the app's saved settings (backup type, excludes
 | Exit code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Success with warnings (skipped files, checksum problems, shadow copy unavailable) |
+| 1 | Success with warnings (skipped files, checksum problems, shadow copy unavailable, one of the two Firebox-mode destinations not saved) |
 | 2 | Failed |
 | 3 | Invalid arguments |
 | 4 | Cancelled (Ctrl+C) |
@@ -130,6 +143,7 @@ The output is `build\Release\EntropyBackup.exe` and `build\Release\EntropyBackup
         backup.json     description, source, type, counts, bytes, duration, skipped files
         verify.json     result of the last verification (if any)
     mirror_latest\      used instead when "Create versioned snapshots" is off
+<Firebox>\EntropyBackup_Versions    snapshot_...\       the same layout; backup.json says "firebox": true
 ```
 
 A snapshot's `files` folder is a plain copy of your project. You can always restore by hand by copying it anywhere.

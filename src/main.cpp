@@ -42,7 +42,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-static const wchar_t* APP_VERSION = L"1.6.1";
+static const wchar_t* APP_VERSION = L"1.7.0";
 static const wchar_t* CLS = L"EntropyBackupGlassWindow";
 static const float DW = 1480.f, DH = 950.f;   // design canvas, scaled uniformly to the window
 static const float PI = 3.14159265f;
@@ -292,6 +292,9 @@ struct Settings {
     // Automation: schedule (0 off, 1 hourly, 2 daily, 3 weekly; day 0 = Sunday), retention (0 = no limit) and integrity.
     int schedMode = 2, schedHour = 2, schedMin = 0, schedDay = 1, keepCount = 0, keepDays = 0;
     bool shadow = false, checksums = false, verifyAfter = false;
+    // Firebox mode: every backup also goes to a second, independent destination (ideally off-site).
+    bool fireOn = false;
+    std::wstring fire;
 };
 static Settings cfg;
 static std::wstring g_appDir, g_exeDir;
@@ -306,7 +309,8 @@ static bool IniBool(const wchar_t* k, bool def) { return IniGet(k, def ? L"1" : 
 static void IniSet(const wchar_t* k, const std::wstring& v) { WritePrivateProfileStringW(L"EntropyBackup", k, v.c_str(), IniPath().c_str()); }
 static void LoadSettings() {
     cfg.remember = IniBool(L"RememberFolders", true);
-    if (cfg.remember) { cfg.from = IniGet(L"From", L""); cfg.to = IniGet(L"To", L""); }
+    if (cfg.remember) { cfg.from = IniGet(L"From", L""); cfg.to = IniGet(L"To", L""); cfg.fire = IniGet(L"Firebox", L""); }
+    cfg.fireOn = IniBool(L"FireboxMode", false);
     cfg.full = IniBool(L"FullCopy", false);
     cfg.hardLinks = IniBool(L"HardLinks", true);
     cfg.preserve = IniBool(L"PreserveMetadata", true);
@@ -346,6 +350,8 @@ static void SaveSettings() {
     IniSet(L"RememberFolders", cfg.remember ? L"1" : L"0");
     IniSet(L"From", cfg.remember ? cfg.from : L"");
     IniSet(L"To", cfg.remember ? cfg.to : L"");
+    IniSet(L"Firebox", cfg.remember ? cfg.fire : L"");
+    IniSet(L"FireboxMode", cfg.fireOn ? L"1" : L"0");
     IniSet(L"FullCopy", cfg.full ? L"1" : L"0");
     IniSet(L"HardLinks", cfg.hardLinks ? L"1" : L"0");
     IniSet(L"PreserveMetadata", cfg.preserve ? L"1" : L"0");
@@ -422,14 +428,17 @@ struct Snap {
     std::wstring dir, id, date, time, desc, source, type, created;
     uint64_t files = 0, copied = 0, reused = 0, bytes = 0, bytesTotal = 0, failed = 0;
     double seconds = 0;
-    bool mirror = false, shadow = false, sums = false, verified = false;
+    bool mirror = false, shadow = false, sums = false, verified = false, firebox = false;
     uint64_t vChecked = 0, vBad = 0;  // last verification: files checked, mismatched or missing
     std::wstring vWhen;
 };
 static std::vector<Snap> snaps;
 static int selSnap = 0, cardScroll = 0, listScroll = 0;
+static bool viewFire = false;  // Version History shows the Firebox instead of the primary backup folder
 
-static std::wstring VersionsRoot() { return cfg.to.empty() ? L"" : Join(cfg.to, L"EntropyBackup_Versions"); }
+static bool FireboxSet() { return cfg.fireOn && !cfg.fire.empty(); }
+static std::wstring ViewDest() { return viewFire && FireboxSet() ? cfg.fire : cfg.to; }
+static std::wstring VersionsRoot() { std::wstring d = ViewDest(); return d.empty() ? L"" : Join(d, L"EntropyBackup_Versions"); }
 static void RefreshHistory() {
     std::wstring keep = (selSnap >= 0 && selSnap < (int)snaps.size()) ? snaps[selSnap].dir : L"";
     snaps.clear();
@@ -460,6 +469,7 @@ static void RefreshHistory() {
         s.failed = (uint64_t)JNum(z, "failed");
         s.seconds = JNum(z, "duration_seconds");
         s.shadow = z.find("\"shadow_copy\": true") != std::string::npos;
+        s.firebox = z.find("\"firebox\": true") != std::string::npos;
         s.sums = z.find("\"checksums\": true") != std::string::npos;
         std::string v;
         if (ReadAll(Join(s.dir, L"verify.json"), v)) {
@@ -495,7 +505,8 @@ struct JobState {
     std::atomic<int> kind{0};   // 0 backup, 1 restore
     std::atomic<int> phase{0};  // 0 idle, 1 scanning, 2 copying, 3 finalizing, 4 done, 5 failed, 6 cancelled
     std::atomic<uint64_t> scanned{0}, copied{0}, linked{0}, skipped{0}, bytesWritten{0}, workDone{0}, workTotal{0};
-    std::atomic<uint64_t> warnings{0};  // skipped files, checksum problems, shadow copy fallback
+    std::atomic<uint64_t> warnings{0};  // skipped files, checksum problems, shadow copy fallback, a destination not saved
+    std::atomic<int> legs{1}, leg{0}, failedLegs{0};  // backup destinations (2 in Firebox mode), the one being written, those not saved
     std::atomic<bool> cancel{false};
     std::mutex m;
     std::chrono::steady_clock::time_point t0, t1;
@@ -509,7 +520,7 @@ static void SetCurrent(const std::wstring& s) { std::lock_guard l(job.m); job.cu
 
 struct FileItem { std::wstring rel; uint64_t size, mtime, ctime; bool link = false, failed = false; std::string sha; };
 struct DirItem { std::wstring rel; FILETIME c, a, w; };
-struct ScanOpts { std::vector<std::wstring> patterns; bool skipHidden = false; std::wstring skipDir; };
+struct ScanOpts { std::vector<std::wstring> patterns; bool skipHidden = false; std::vector<std::wstring> skipDirs; };
 struct Fail { std::wstring msg; };
 struct Cancelled {};
 static const uint64_t FILE_COST = 16384;  // per-file overhead used to weight progress
@@ -536,7 +547,7 @@ static void Scan(const std::wstring& root, const std::wstring& rel, const ScanOp
         if (Excluded(n, r, o)) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;  // junctions/symlinked dirs: avoid loops
-            if (!o.skipDir.empty() && Lower(Join(root, r)) == o.skipDir) continue;
+            if (!o.skipDirs.empty() && std::find(o.skipDirs.begin(), o.skipDirs.end(), Lower(Join(root, r))) != o.skipDirs.end()) continue;
             dirs.push_back({r, fd.ftCreationTime, fd.ftLastAccessTime, fd.ftLastWriteTime});
             subs.push_back(r);
         } else {
@@ -824,7 +835,27 @@ struct BackupParams {
     std::vector<std::wstring> patterns;
     bool shadow, checksums, verify;
     int keep, keepDays;
+    std::wstring fire;  // Firebox: a second, independent destination ("" = Firebox mode off)
 };
+// Why `fire` cannot be used as the Firebox next to the backup folder `to`, or "" if the pair is fine.
+static std::wstring FireboxConflict(const std::wstring& to, const std::wstring& fire) {
+    std::wstring a = NormPath(to), b = NormPath(fire);
+    if (Lower(a) == Lower(b)) return L"The Firebox must be a different folder from the backup folder.";
+    if (IsUnder(b, Join(a, L"EntropyBackup_Versions")) || IsUnder(a, Join(b, L"EntropyBackup_Versions")))
+        return L"The Firebox cannot be inside the other destination's versions folder.";
+    return {};
+}
+// True when both folders are on the same local volume, so a Firebox there would not survive losing that drive.
+// Network paths are skipped: asking an unreachable server would stall the window.
+static bool SameDrive(const std::wstring& a, const std::wstring& b) {
+    auto serial = [](const std::wstring& p, DWORD& s) {
+        wchar_t vol[MAX_PATH + 1] = {};
+        if (p.empty() || p.rfind(L"\\\\", 0) == 0 || !GetVolumePathNameW(p.c_str(), vol, MAX_PATH) || GetDriveTypeW(vol) == DRIVE_REMOTE) return false;
+        return GetVolumeInformationW(vol, nullptr, 0, &s, nullptr, nullptr, nullptr, 0) != FALSE;
+    };
+    DWORD x = 0, y = 0;
+    return serial(NormPath(a), x) && serial(NormPath(b), y) && x == y;
+}
 static void FinishJob(int phase, const std::wstring& msg, const std::wstring& dir = L"") {
     std::wstring title;
     {
@@ -839,39 +870,221 @@ static void FinishJob(int phase, const std::wstring& msg, const std::wstring& di
     job.phase = phase;
     if (g_hwnd) PostMessageW(g_hwnd, WM_APP_JOBDONE, 0, 0);
 }
-static void BackupWorker(BackupParams P) {
-    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // for the Volume Shadow Copy service
-    std::wstring work;
-    try {
-        std::wstring src = NormPath(P.src), dst = NormPath(P.dst);
-        if (!IsDir(src)) throw Fail{L"The source folder does not exist."};
-        std::wstring root = Join(dst, L"EntropyBackup_Versions");
-        if (Lower(src) == Lower(dst)) throw Fail{L"Source and backup folders must be different."};
-        if (IsUnder(src, root)) throw Fail{L"The source folder is inside the backup folder."};
-        if (!MakeDirs(root)) throw Fail{L"Cannot create the backup folder: " + SysMsg(GetLastError())};
-        VersionsLock lock(root);
-        {  // leftovers of an interrupted run (power loss, killed process) are never valid snapshots
-            WIN32_FIND_DATAW fd;
-            HANDLE h = FindFirstFileExW(XP(Join(root, L"incomplete_*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
-            if (h != INVALID_HANDLE_VALUE) {
-                do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(Join(root, fd.cFileName)); } while (FindNextFileW(h, &fd));
-                FindClose(h);
+// One destination of a backup. With Firebox mode on there are two, and each gets its own complete,
+// independent snapshot chain: neither is ever copied from the other, so either one can be lost.
+struct Leg {
+    std::wstring name, dst, root, id, prev, work, final, error;
+    std::unique_ptr<VersionsLock> lock;
+    std::vector<FileItem> files;  // the scanned files, classified against this destination's previous snapshot
+    bool ok = false;
+    uint64_t failed = 0, copied = 0, linked = 0, written = 0;
+    std::vector<std::wstring> failedNames;
+};
+// Locks the destination, clears interrupted runs and reserves the snapshot folder. Throws Fail.
+static void PrepareLeg(Leg& L, const std::wstring& src, const SYSTEMTIME& start, bool versioned) {
+    if (L.dst.empty()) throw Fail{L"No folder was chosen."};
+    L.root = Join(L.dst, L"EntropyBackup_Versions");
+    if (Lower(src) == Lower(L.dst)) throw Fail{L"Source and backup folders must be different."};
+    if (IsUnder(src, L.root)) throw Fail{L"The source folder is inside the backup folder."};
+    if (!MakeDirs(L.root)) throw Fail{L"Cannot create the backup folder: " + SysMsg(GetLastError())};
+    L.lock = std::make_unique<VersionsLock>(L.root);
+    {  // leftovers of an interrupted run (power loss, killed process) are never valid snapshots
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW(XP(Join(L.root, L"incomplete_*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
+        if (h != INVALID_HANDLE_VALUE) {
+            do { if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveTree(Join(L.root, fd.cFileName)); } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    SYSTEMTIME now = start;
+    L.id = IdFromTime(now);
+    while (versioned && IsDir(Join(L.root, L"snapshot_" + L.id))) {  // IDs have one-second resolution: wait for a free one
+        Sleep(200);
+        GetLocalTime(&now);
+        L.id = IdFromTime(now);
+    }
+    L.prev = FindPrevious(L.root, versioned);
+    L.work = Join(L.root, L"incomplete_" + L.id);
+    if (!MakeDirs(Join(L.work, L"files"))) throw Fail{L"Cannot write to the backup folder: " + SysMsg(GetLastError())};
+}
+// Marks the files unchanged since this destination's previous snapshot. Returns the bytes this leg will copy.
+static uint64_t ClassifyLeg(Leg& L, const BackupParams& P) {
+    bool incremental = !P.full && !L.prev.empty();
+    std::vector<ManEntry> prevMan;
+    bool haveManifest = incremental && LoadManifest(Join(L.prev, L"manifest.tsv"), prevMan);
+    std::unordered_map<std::wstring, const ManEntry*> man;
+    for (auto& e : prevMan) man[Lower(e.rel)] = &e;
+    uint64_t copyBytes = 0;
+    for (auto& f : L.files) {
+        const ManEntry* pe = nullptr;
+        if (incremental) {
+            if (haveManifest) {
+                auto it = man.find(Lower(f.rel));
+                pe = it == man.end() ? nullptr : it->second;
+                f.link = pe && pe->size == f.size && pe->mtime == f.mtime;
+            } else {  // legacy snapshot without manifest: compare against the stored copy
+                WIN32_FILE_ATTRIBUTE_DATA a{};
+                if (GetFileAttributesExW(XP(Join(Join(L.prev, L"files"), f.rel)).c_str(), GetFileExInfoStandard, &a))
+                    f.link = (((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow) == f.size &&
+                             (((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime) == f.mtime;
             }
         }
-
-        SYSTEMTIME now; GetLocalTime(&now);
-        std::wstring id = IdFromTime(now);
-        while (P.versioned && IsDir(Join(root, L"snapshot_" + id))) {  // IDs have one-second resolution: wait for a free one
-            Sleep(200);
-            GetLocalTime(&now);
-            id = IdFromTime(now);
+        if (!f.link || !P.hardLinks) copyBytes += f.size;
+        if (P.checksums && f.link && pe && !pe->sha.empty()) f.sha = pe->sha;  // an unchanged file keeps the checksum it was stored with
+    }
+    return copyBytes;
+}
+// Copies or links every file into the leg's incomplete_ folder. `srcSha` caches source checksums, so a file is
+// hashed once even when both destinations need it. Throws Fail (this leg only) or Cancelled (the whole job).
+static void CopyLeg(Leg& L, const BackupParams& P, const std::wstring& from, const std::vector<DirItem>& dirs, std::vector<std::string>& srcSha, uint64_t& base) {
+    std::wstring filesDir = Join(L.work, L"files"), prevFiles = L.prev.empty() ? L"" : Join(L.prev, L"files");
+    uint64_t c0 = job.copied, l0 = job.linked, w0 = job.bytesWritten;
+    for (auto& d : dirs) CreateDirectoryW(XP(Join(filesDir, d.rel)).c_str(), nullptr);
+    bool linksWork = true;
+    Hasher hs;
+    for (size_t i = 0; i < L.files.size(); i++) {
+        FileItem& f = L.files[i];
+        if (job.cancel) throw Cancelled{};
+        SetCurrent(f.rel);
+        std::wstring out = Join(filesDir, f.rel), in = Join(from, f.rel);
+        if (P.checksums && f.sha.empty()) {
+            if (srcSha[i].empty()) {
+                srcSha[i] = hs.File(in, false, base);
+                if (job.cancel) throw Cancelled{};
+                base += f.size;
+            }
+            f.sha = srcSha[i];
         }
-        std::wstring prev = FindPrevious(root, P.versioned);
-        work = Join(root, L"incomplete_" + id);
-        std::wstring filesDir = Join(work, L"files");
-        if (!MakeDirs(filesDir)) throw Fail{L"Cannot write to the backup folder: " + SysMsg(GetLastError())};
+        bool done = false;
+        if (f.link) {
+            std::wstring old = Join(prevFiles, f.rel);
+            if (P.hardLinks && linksWork) {
+                if (CreateHardLinkW(XP(out).c_str(), XP(old).c_str(), nullptr)) done = true;
+                else { DWORD e = GetLastError(); if (e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED) linksWork = false; }
+            } else if (!P.hardLinks) {  // unchanged: copy locally from the previous snapshot
+                CopyCtx c{base};
+                done = CopyFileExW(XP(old).c_str(), XP(out).c_str(), CopyProgress, &c, nullptr, 0) != FALSE;
+                if (done) job.bytesWritten += f.size;
+            }
+            if (done) job.linked++;
+        }
+        if (!done) {
+            CopyCtx c{base};
+            if (CopyFileExW(XP(in).c_str(), XP(out).c_str(), CopyProgress, &c, nullptr, 0)) {
+                job.copied++;
+                job.bytesWritten += f.size;
+                done = true;
+                if (P.preserve) { FILETIME ct = FT(f.ctime); SetTimes(out, &ct, nullptr, nullptr, false); }
+            } else {
+                DWORD e = GetLastError();
+                if (e == ERROR_REQUEST_ABORTED || job.cancel) throw Cancelled{};
+                if (e == ERROR_DISK_FULL || e == ERROR_HANDLE_DISK_FULL) throw Fail{L"The backup drive is full."};
+                f.failed = true;
+                L.failed++;
+                if (L.failedNames.size() < 200) L.failedNames.push_back(f.rel + L" (" + SysMsg(e) + L")");
+            }
+        }
+        if (done && !P.preserve && !f.link) {
+            SYSTEMTIME st; GetSystemTime(&st);
+            FILETIME n; SystemTimeToFileTime(&st, &n);
+            SetFileAttributesW(XP(out).c_str(), FILE_ATTRIBUTE_NORMAL);
+            SetTimes(out, &n, &n, &n, false);
+        }
+        base += (f.link && P.hardLinks ? 0 : f.size) + FILE_COST;
+        job.workDone = base;
+    }
+    L.copied = job.copied - c0;
+    L.linked = job.linked - l0;
+    L.written = job.bytesWritten - w0;
+}
+// Directory times, manifest, backup.json, then the atomic rename that makes the snapshot real. Throws Fail.
+static void FinalizeLeg(Leg& L, const BackupParams& P, const std::wstring& src, const std::vector<DirItem>& dirs, const SYSTEMTIME& now, bool shadowed, bool firebox) {
+    std::wstring filesDir = Join(L.work, L"files");
+    if (P.preserve)
+        for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SetTimes(Join(filesDir, it->rel), &it->c, &it->a, &it->w, true);
+    std::string manifest = P.checksums ? "# Entropy Backup manifest v2: size<TAB>mtime<TAB>sha256<TAB>path\n"
+                                       : "# Entropy Backup manifest v1: size<TAB>mtime<TAB>path\n";
+    manifest.reserve(L.files.size() * (P.checksums ? 130 : 64));
+    uint64_t totalBytes = 0;
+    for (auto& f : L.files) {
+        totalBytes += f.size;
+        if (!f.failed)
+            manifest += std::to_string(f.size) + "\t" + std::to_string(f.mtime) + "\t" + (P.checksums ? (f.sha.empty() ? "-" : f.sha) + "\t" : "") + U8(f.rel) + "\n";
+    }
+    WriteAll(Join(L.work, L"manifest.tsv"), manifest);
 
-        // 1. Optional shadow copy, then scan (from the shadow copy when there is one)
+    double secs;
+    { std::lock_guard l(job.m); secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.t0).count(); }
+    static const wchar_t* mon[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    wchar_t human[64], iso[32];
+    swprintf_s(human, L"%s %d, %d  %d:%02d %s", mon[now.wMonth - 1], now.wDay, now.wYear, now.wHour % 12 ? now.wHour % 12 : 12, now.wMinute, now.wHour < 12 ? L"AM" : L"PM");
+    swprintf_s(iso, L"%04d-%02d-%02dT%02d:%02d:%02d", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+    std::wstring j = L"{\n";
+    j += L"  \"version\": 3,\n";
+    j += L"  \"app\": \"Entropy Backup " + std::wstring(APP_VERSION) + L"\",\n";
+    j += L"  \"created\": \"" + std::wstring(human) + L"\",\n";
+    j += L"  \"created_iso\": \"" + std::wstring(iso) + L"\",\n";
+    j += L"  \"source\": \"" + JsonEsc(src) + L"\",\n";
+    j += L"  \"description\": \"" + JsonEsc(P.desc) + L"\",\n";
+    j += L"  \"type\": \"" + std::wstring(P.full ? L"full" : L"incremental") + L"\",\n";
+    j += L"  \"firebox\": " + std::wstring(firebox ? L"true" : L"false") + L",\n";
+    j += L"  \"hard_links\": " + std::wstring(P.hardLinks && !P.full ? L"true" : L"false") + L",\n";
+    j += L"  \"shadow_copy\": " + std::wstring(shadowed ? L"true" : L"false") + L",\n";
+    j += L"  \"checksums\": " + std::wstring(P.checksums ? L"true" : L"false") + L",\n";
+    j += L"  \"previous\": \"" + JsonEsc(L.prev.empty() ? L"" : L.prev.substr(L.prev.find_last_of(L'\\') + 1)) + L"\",\n";
+    j += L"  \"files\": " + std::to_wstring(L.files.size() - L.failed) + L",\n";
+    j += L"  \"copied\": " + std::to_wstring(L.copied) + L",\n";
+    j += L"  \"reused\": " + std::to_wstring(L.linked) + L",\n";
+    j += L"  \"bytes_written\": " + std::to_wstring(L.written) + L",\n";
+    j += L"  \"bytes_total\": " + std::to_wstring(totalBytes) + L",\n";
+    wchar_t sec[32]; swprintf_s(sec, L"%.1f", secs);
+    j += L"  \"duration_seconds\": " + std::wstring(sec) + L",\n";
+    j += L"  \"excludes\": [";
+    for (size_t i = 0; i < P.patterns.size(); i++) j += (i ? L", \"" : L"\"") + JsonEsc(P.patterns[i]) + L"\"";
+    j += L"],\n  \"failed\": " + std::to_wstring(L.failed) + L",\n  \"failed_files\": [";
+    for (size_t i = 0; i < L.failedNames.size(); i++) j += (i ? L",\n    \"" : L"\n    \"") + JsonEsc(L.failedNames[i]) + L"\"";
+    j += L.failedNames.empty() ? L"]\n}\n" : L"\n  ]\n}\n";
+    WriteAll(Join(L.work, L"backup.json"), U8(j));
+
+    L.final = Join(L.root, P.versioned ? L"snapshot_" + L.id : L"mirror_latest");
+    if (!P.versioned && IsDir(L.final)) RemoveTree(L.final);
+    if (!MoveFileExW(XP(L.work).c_str(), XP(L.final).c_str(), 0)) throw Fail{L"Could not finalize the snapshot: " + SysMsg(GetLastError())};
+    L.work.clear();
+    L.ok = true;
+}
+static void BackupWorker(BackupParams P) {
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // for the Volume Shadow Copy service
+    std::vector<Leg> legs(P.fire.empty() ? 1 : 2);
+    auto dropLeg = [](Leg& L, const std::wstring& why) {
+        L.error = why;
+        if (!L.work.empty()) RemoveTree(L.work);
+        L.work.clear();
+        L.lock.reset();
+    };
+    try {
+        std::wstring src = NormPath(P.src);
+        if (!IsDir(src)) throw Fail{L"The source folder does not exist."};
+        legs[0].name = L"Primary";
+        legs[0].dst = NormPath(P.dst);
+        if (legs.size() == 2) {
+            std::wstring why = FireboxConflict(P.dst, P.fire);
+            if (!why.empty()) throw Fail{why};
+            legs[1].name = L"Firebox";
+            legs[1].dst = NormPath(P.fire);
+        }
+        job.legs = (int)legs.size();
+
+        // 0. Reserve every destination. One that cannot be reached (an unplugged drive, an offline NAS) is
+        //    reported, and the backup still goes to the other: that is the point of keeping two.
+        SYSTEMTIME now; GetLocalTime(&now);
+        size_t ready = 0;
+        for (auto& L : legs) {
+            try { PrepareLeg(L, src, now, P.versioned); ready++; }
+            catch (const Fail& f) { dropLeg(L, f.msg); }
+        }
+        if (!ready) throw Fail{legs.size() == 1 ? legs[0].error : L"Primary: " + legs[0].error + L" Firebox: " + legs[1].error};
+
+        // 1. Optional shadow copy, then one scan shared by every destination (from the shadow copy when there is one)
         Shadow shadow;
         std::wstring from = src, notes;
         if (P.shadow) {
@@ -883,96 +1096,34 @@ static void BackupWorker(BackupParams P) {
         ScanOpts o;
         o.patterns = P.patterns;
         o.skipHidden = P.skipHidden;
-        o.skipDir = IsUnder(root, src) ? Lower(from == src ? root : shadow.Map(root)) : L"";  // never back up our own versions folder
+        for (auto& L : legs)  // never back up our own versions folders
+            if (!L.root.empty() && IsUnder(L.root, src)) o.skipDirs.push_back(Lower(from == src ? L.root : shadow.Map(L.root)));
         std::vector<FileItem> files;
         std::vector<DirItem> dirs;
         Scan(from, L"", o, files, dirs);
         if (job.cancel) throw Cancelled{};
 
-        // 2. Classify unchanged files against the previous snapshot
-        bool incremental = !P.full && !prev.empty();
-        std::vector<ManEntry> prevMan;
-        bool haveManifest = incremental && LoadManifest(Join(prev, L"manifest.tsv"), prevMan);
-        std::unordered_map<std::wstring, const ManEntry*> man;
-        for (auto& e : prevMan) man[Lower(e.rel)] = &e;
-        uint64_t copyBytes = 0, hashBytes = 0, totalBytes = 0;
-        for (auto& f : files) {
-            totalBytes += f.size;
-            const ManEntry* pe = nullptr;
-            if (incremental) {
-                if (haveManifest) {
-                    auto it = man.find(Lower(f.rel));
-                    pe = it == man.end() ? nullptr : it->second;
-                    f.link = pe && pe->size == f.size && pe->mtime == f.mtime;
-                } else {  // legacy snapshot without manifest: compare against the stored copy
-                    WIN32_FILE_ATTRIBUTE_DATA a{};
-                    if (GetFileAttributesExW(XP(Join(Join(prev, L"files"), f.rel)).c_str(), GetFileExInfoStandard, &a))
-                        f.link = (((uint64_t)a.nFileSizeHigh << 32) | a.nFileSizeLow) == f.size &&
-                                 (((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime) == f.mtime;
-                }
-            }
-            if (!f.link || !P.hardLinks) copyBytes += f.size;
-            if (P.checksums) {  // an unchanged file keeps the checksum it was stored with
-                if (f.link && pe && !pe->sha.empty()) f.sha = pe->sha;
-                else hashBytes += f.size;
-            }
+        // 2. Classify unchanged files against each destination's own previous snapshot
+        uint64_t total = 0;
+        std::vector<char> needHash(files.size());
+        for (auto& L : legs) {
+            if (!L.lock) continue;
+            L.files = files;
+            total += ClassifyLeg(L, P) + files.size() * FILE_COST;
+            for (size_t i = 0; i < files.size(); i++) if (P.checksums && L.files[i].sha.empty()) needHash[i] = 1;
         }
-        job.workTotal = copyBytes + hashBytes + files.size() * FILE_COST + 1;
+        for (size_t i = 0; i < files.size(); i++) if (needHash[i]) total += files[i].size;
+        job.workTotal = total + 1;
         job.phase = 2;
 
-        // 3. Copy / link
-        for (auto& d : dirs) CreateDirectoryW(XP(Join(filesDir, d.rel)).c_str(), nullptr);
-        uint64_t base = 0, failed = 0;
-        bool linksWork = true;
-        std::vector<std::wstring> failedNames;
-        std::wstring prevFiles = prev.empty() ? L"" : Join(prev, L"files");
-        Hasher hs;
-        for (auto& f : files) {
-            if (job.cancel) throw Cancelled{};
-            SetCurrent(f.rel);
-            std::wstring out = Join(filesDir, f.rel), in = Join(from, f.rel);
-            if (P.checksums && f.sha.empty()) {
-                f.sha = hs.File(in, false, base);
-                if (job.cancel) throw Cancelled{};
-                base += f.size;
-            }
-            bool done = false;
-            if (f.link) {
-                std::wstring old = Join(prevFiles, f.rel);
-                if (P.hardLinks && linksWork) {
-                    if (CreateHardLinkW(XP(out).c_str(), XP(old).c_str(), nullptr)) done = true;
-                    else { DWORD e = GetLastError(); if (e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED) linksWork = false; }
-                } else if (!P.hardLinks) {  // unchanged: copy locally from the previous snapshot
-                    CopyCtx c{base};
-                    done = CopyFileExW(XP(old).c_str(), XP(out).c_str(), CopyProgress, &c, nullptr, 0) != FALSE;
-                    if (done) job.bytesWritten += f.size;
-                }
-                if (done) job.linked++;
-            }
-            if (!done) {
-                CopyCtx c{base};
-                if (CopyFileExW(XP(in).c_str(), XP(out).c_str(), CopyProgress, &c, nullptr, 0)) {
-                    job.copied++;
-                    job.bytesWritten += f.size;
-                    done = true;
-                    if (P.preserve) { FILETIME ct = FT(f.ctime); SetTimes(out, &ct, nullptr, nullptr, false); }
-                } else {
-                    DWORD e = GetLastError();
-                    if (e == ERROR_REQUEST_ABORTED || job.cancel) throw Cancelled{};
-                    if (e == ERROR_DISK_FULL || e == ERROR_HANDLE_DISK_FULL) throw Fail{L"The backup drive is full."};
-                    f.failed = true;
-                    failed++;
-                    if (failedNames.size() < 200) failedNames.push_back(f.rel + L" (" + SysMsg(e) + L")");
-                }
-            }
-            if (done && !P.preserve && !f.link) {
-                SYSTEMTIME st; GetSystemTime(&st);
-                FILETIME n; SystemTimeToFileTime(&st, &n);
-                SetFileAttributesW(XP(out).c_str(), FILE_ATTRIBUTE_NORMAL);
-                SetTimes(out, &n, &n, &n, false);
-            }
-            base += (f.link && P.hardLinks ? 0 : f.size) + FILE_COST;
-            job.workDone = base;
+        // 3. Copy / link into each destination in turn. A failure there costs only that destination.
+        std::vector<std::string> srcSha(files.size());
+        uint64_t base = 0;
+        for (size_t k = 0; k < legs.size(); k++) {
+            if (!legs[k].lock) continue;
+            job.leg = (int)k;
+            try { CopyLeg(legs[k], P, from, dirs, srcSha, base); }
+            catch (const Fail& f) { dropLeg(legs[k], f.msg); }
         }
         bool shadowed = from != src;
         shadow.Close();
@@ -980,81 +1131,64 @@ static void BackupWorker(BackupParams P) {
         // 4. Finalize: directory times, manifest, metadata, atomic rename
         job.phase = 3;
         SetCurrent(L"");
-        if (P.preserve)
-            for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SetTimes(Join(filesDir, it->rel), &it->c, &it->a, &it->w, true);
-        std::string manifest = P.checksums ? "# Entropy Backup manifest v2: size<TAB>mtime<TAB>sha256<TAB>path\n"
-                                           : "# Entropy Backup manifest v1: size<TAB>mtime<TAB>path\n";
-        manifest.reserve(files.size() * (P.checksums ? 130 : 64));
-        for (auto& f : files)
-            if (!f.failed)
-                manifest += std::to_string(f.size) + "\t" + std::to_string(f.mtime) + "\t" + (P.checksums ? (f.sha.empty() ? "-" : f.sha) + "\t" : "") + U8(f.rel) + "\n";
-        WriteAll(Join(work, L"manifest.tsv"), manifest);
-
-        double secs;
-        { std::lock_guard l(job.m); secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - job.t0).count(); }
-        static const wchar_t* mon[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun", L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
-        wchar_t human[64], iso[32];
-        swprintf_s(human, L"%s %d, %d  %d:%02d %s", mon[now.wMonth - 1], now.wDay, now.wYear, now.wHour % 12 ? now.wHour % 12 : 12, now.wMinute, now.wHour < 12 ? L"AM" : L"PM");
-        swprintf_s(iso, L"%04d-%02d-%02dT%02d:%02d:%02d", now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
-        std::wstring j = L"{\n";
-        j += L"  \"version\": 3,\n";
-        j += L"  \"app\": \"Entropy Backup " + std::wstring(APP_VERSION) + L"\",\n";
-        j += L"  \"created\": \"" + std::wstring(human) + L"\",\n";
-        j += L"  \"created_iso\": \"" + std::wstring(iso) + L"\",\n";
-        j += L"  \"source\": \"" + JsonEsc(src) + L"\",\n";
-        j += L"  \"description\": \"" + JsonEsc(P.desc) + L"\",\n";
-        j += L"  \"type\": \"" + std::wstring(P.full ? L"full" : L"incremental") + L"\",\n";
-        j += L"  \"hard_links\": " + std::wstring(P.hardLinks && !P.full ? L"true" : L"false") + L",\n";
-        j += L"  \"shadow_copy\": " + std::wstring(shadowed ? L"true" : L"false") + L",\n";
-        j += L"  \"checksums\": " + std::wstring(P.checksums ? L"true" : L"false") + L",\n";
-        j += L"  \"previous\": \"" + JsonEsc(prev.empty() ? L"" : prev.substr(prev.find_last_of(L'\\') + 1)) + L"\",\n";
-        j += L"  \"files\": " + std::to_wstring(files.size() - failed) + L",\n";
-        j += L"  \"copied\": " + std::to_wstring(job.copied.load()) + L",\n";
-        j += L"  \"reused\": " + std::to_wstring(job.linked.load()) + L",\n";
-        j += L"  \"bytes_written\": " + std::to_wstring(job.bytesWritten.load()) + L",\n";
-        j += L"  \"bytes_total\": " + std::to_wstring(totalBytes) + L",\n";
-        wchar_t sec[32]; swprintf_s(sec, L"%.1f", secs);
-        j += L"  \"duration_seconds\": " + std::wstring(sec) + L",\n";
-        j += L"  \"excludes\": [";
-        for (size_t i = 0; i < P.patterns.size(); i++) j += (i ? L", \"" : L"\"") + JsonEsc(P.patterns[i]) + L"\"";
-        j += L"],\n  \"failed\": " + std::to_wstring(failed) + L",\n  \"failed_files\": [";
-        for (size_t i = 0; i < failedNames.size(); i++) j += (i ? L",\n    \"" : L"\n    \"") + JsonEsc(failedNames[i]) + L"\"";
-        j += failedNames.empty() ? L"]\n}\n" : L"\n  ]\n}\n";
-        WriteAll(Join(work, L"backup.json"), U8(j));
-
-        std::wstring final = Join(root, P.versioned ? L"snapshot_" + id : L"mirror_latest");
-        if (!P.versioned && IsDir(final)) RemoveTree(final);
-        if (!MoveFileExW(XP(work).c_str(), XP(final).c_str(), 0)) throw Fail{L"Could not finalize the snapshot: " + SysMsg(GetLastError())};
-        work.clear();
-
-        std::wstring msg = Num(files.size() - failed) + L" files protected, " + Num(job.linked.load()) + L" unchanged reused, " + Bytes(job.bytesWritten.load()) + L" written.";
-        if (failed) { msg += L" " + Num(failed) + L" locked/unreadable files skipped."; job.warnings += failed; }
-        msg += notes;
-        // 5. Optional verification of what was written, then retention
-        if (P.verify && P.checksums) {
-            try {
-                VerifyResult v;
-                VerifySnapshot(final, v);
-                msg += L" " + VerifySummary(v);
-                job.warnings += v.bad + v.missing;
-            } catch (const Cancelled&) {
-                msg += L" Verification was cancelled; the snapshot was kept.";
-                job.warnings++;
-            }
+        for (size_t k = 0; k < legs.size(); k++) {
+            if (!legs[k].lock) continue;
+            job.leg = (int)k;
+            try { FinalizeLeg(legs[k], P, src, dirs, now, shadowed, k == 1); }
+            catch (const Fail& f) { dropLeg(legs[k], f.msg); }
         }
-        if (P.versioned)
-            if (int n = Prune(root, P.keep, P.keepDays)) msg += L" Removed " + Num(n) + (n == 1 ? L" old snapshot." : L" old snapshots.");
-        FinishJob(4, msg, final);
+
+        // 5. Per destination: summary, optional verification of what was written, then retention
+        std::wstring msg, dir;
+        size_t saved = 0;
+        for (size_t k = 0; k < legs.size(); k++) {
+            Leg& L = legs[k];
+            job.leg = (int)k;
+            std::wstring pre = legs.size() == 1 ? L"" : L.name + L": ";
+            if (!L.ok) {
+                msg += (msg.empty() ? L"" : L"  ") + pre + L"NOT SAVED. " + L.error;
+                job.warnings++;
+                continue;
+            }
+            saved++;
+            if (dir.empty()) dir = L.final;
+            // One destination keeps the full sentence; with two, each gets a compact clause so both fit the status panel.
+            bool brief = legs.size() > 1;
+            std::wstring m = brief ? Num(L.files.size() - L.failed) + L" files, " + Bytes(L.written) + L" written"
+                                   : Num(L.files.size() - L.failed) + L" files protected, " + Num(L.linked) + L" unchanged reused, " + Bytes(L.written) + L" written.";
+            if (L.failed) { m += brief ? L", " + Num(L.failed) + L" unreadable skipped" : L" " + Num(L.failed) + L" locked/unreadable files skipped."; job.warnings += L.failed; }
+            if (P.verify && P.checksums) {
+                try {
+                    VerifyResult v;
+                    VerifySnapshot(L.final, v);
+                    uint64_t bad = v.bad + v.missing;
+                    m += brief ? (bad ? L", " + Num(bad) + L" FAILED verification" : std::wstring(L", verified")) : L" " + VerifySummary(v);
+                    job.warnings += bad;
+                } catch (const Cancelled&) {
+                    m += brief ? L", verification cancelled" : L" Verification was cancelled; the snapshot was kept.";
+                    job.warnings++;
+                }
+            }
+            if (P.versioned)
+                if (int n = Prune(L.root, P.keep, P.keepDays))
+                    m += brief ? L", " + Num(n) + L" old removed" : L" Removed " + Num(n) + (n == 1 ? L" old snapshot." : L" old snapshots.");
+            msg += (msg.empty() ? L"" : L"  ") + pre + m + (brief ? L"." : L"");
+        }
+        msg += notes;
+        job.failedLegs = (int)(legs.size() - saved);
+        if (saved) FinishJob(4, msg, dir);
+        else FinishJob(5, msg);
     } catch (const Fail& f) {
-        if (!work.empty()) RemoveTree(work);
+        for (auto& L : legs) dropLeg(L, f.msg);
         FinishJob(5, f.msg);
     } catch (const Cancelled&) {
-        if (!work.empty()) RemoveTree(work);
+        for (auto& L : legs) dropLeg(L, L"");
         FinishJob(6, L"Cancelled. No partial snapshot was kept.");
     } catch (const std::exception& e) {
-        if (!work.empty()) RemoveTree(work);
+        for (auto& L : legs) dropLeg(L, L"");
         FinishJob(5, W8(e.what()));
     }
+    for (auto& L : legs) L.lock.reset();
     if (SUCCEEDED(co)) CoUninitialize();
 }
 static void RestoreWorker(std::wstring snapDir, std::wstring target, bool overwrite) {
@@ -1225,7 +1359,7 @@ static float TW(const std::wstring& s, float size, DWRITE_FONT_WEIGHT wt = REG) 
 // Vector icons (24-unit grid, scaled to size s)
 // ---------------------------------------------------------------------------------------------
 enum Ico { IC_NONE, IC_HOME, IC_HISTORY, IC_RESTORE, IC_GEAR, IC_EXCLUDE, IC_INFO, IC_FOLDER, IC_DRIVE, IC_DOC, IC_CUBE,
-           IC_DB, IC_CHEVRON, IC_DOTS, IC_HISTHDR, IC_FOLDEROPEN, IC_STOP, IC_CHECK, IC_CALENDAR };
+           IC_DB, IC_CHEVRON, IC_DOTS, IC_HISTHDR, IC_FOLDEROPEN, IC_STOP, IC_CHECK, IC_CALENDAR, IC_FLAME };
 static void Icon(int ic, float x, float y, float s, D2D1_COLOR_F c) {
     float u = s / 24.f, w = std::max(1.f, 1.7f * u);
     auto p = [&](float a, float b) { return P2(x + a * u, y + b * u); };
@@ -1342,6 +1476,24 @@ static void Icon(int ic, float x, float y, float s, D2D1_COLOR_F c) {
     case IC_CHECK:
         stroke(Geo([&](ID2D1GeometrySink* k) { Poly(k, {p(-5.5f, 0.5f), p(-1.5f, 4.5f), p(6, -4.5f)}, false); }).Get(), 2.4f * u);
         break;
+    case IC_FLAME: {  // Firebox: a flame with an inner tongue
+        auto bez = [&](ID2D1GeometrySink* k, float a, float b, float c, float d, float e, float f) { k->AddBezier(D2D1::BezierSegment(p(a, b), p(c, d), p(e, f))); };
+        stroke(Geo([&](ID2D1GeometrySink* k) {
+            k->BeginFigure(p(0, 10.5f), D2D1_FIGURE_BEGIN_HOLLOW);
+            bez(k, -6.5f, 10.5f, -9, 5, -7.5f, 0);
+            bez(k, -6.2f, -4, -2.2f, -5, -1.6f, -10.5f);
+            bez(k, 3.5f, -7.5f, 8.2f, -2.5f, 7.6f, 3);
+            bez(k, 7.1f, 7.6f, 3.8f, 10.5f, 0, 10.5f);
+            k->EndFigure(D2D1_FIGURE_END_CLOSED);
+            k->BeginFigure(p(0, 10.5f), D2D1_FIGURE_BEGIN_HOLLOW);
+            bez(k, -2.8f, 10.5f, -4, 7.5f, -3, 5);
+            bez(k, -2.2f, 3, -0.4f, 2.5f, 0.3f, 0);
+            bez(k, 2.4f, 2, 3.8f, 4.5f, 3.2f, 7);
+            bez(k, 2.8f, 9, 1.5f, 10.5f, 0, 10.5f);
+            k->EndFigure(D2D1_FIGURE_END_CLOSED);
+        }).Get(), w);
+        break;
+    }
     case IC_CALENDAR:
         R->DrawRoundedRectangle(D2D1::RoundedRect(RC(x - 8.5f * u, y - 6.5f * u, x + 8.5f * u, y + 8.5f * u), 2.5f * u, 2.5f * u), br.Get(), w);
         stroke(Geo([&](ID2D1GeometrySink* k) {
@@ -1692,11 +1844,13 @@ static std::wstring ApplySchedule() {
               (cfg.schedMode == 2 ? std::wstring(L"<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>")
                                   : L"<ScheduleByWeek><DaysOfWeek><" + std::wstring(DAY_NAMES[cfg.schedDay]) + L" /></DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>") +
               L"</CalendarTrigger>";
-    std::wstring args = L"backup --scheduled --from " + QuoteArg(from) + L" --to " + QuoteArg(to);
+    std::wstring fire = FireboxSet() ? NormPath(cfg.fire) : L"";
+    if (!fire.empty() && !FireboxConflict(to, fire).empty()) return FireboxConflict(to, fire);
+    std::wstring args = L"backup --scheduled --from " + QuoteArg(from) + L" --to " + QuoteArg(to) + (fire.empty() ? L" --no-firebox" : L" --firebox " + QuoteArg(fire));
     std::wstring xml =
         L"<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
         L"<RegistrationInfo><Author>Entropy Backup</Author><Description>" +
-        XmlEsc(L"Backs up " + from + L" to " + to + L". Other options come from the Entropy Backup settings.") +
+        XmlEsc(L"Backs up " + from + L" to " + to + (fire.empty() ? L"" : L" and to the Firebox " + fire) + L". Other options come from the Entropy Backup settings.") +
         L"</Description></RegistrationInfo><Triggers>" + trig + L"</Triggers>"
         L"<Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>" + (cfg.shadow ? L"HighestAvailable" : L"LeastPrivilege") +
         L"</RunLevel></Principal></Principals>"
@@ -1710,17 +1864,18 @@ static std::wstring ApplySchedule() {
     if (hr == E_ACCESSDENIED && cfg.shadow)
         return L"Saving a schedule that uses shadow copies needs administrator rights. Run the app as administrator once, or turn off shadow copy.";
     if (FAILED(hr)) return L"Could not save the schedule (" + HexCode(hr) + L").";
-    IniSet(L"ScheduleSummary", ScheduleText() + L":  " + from + L"  →  " + to);
+    IniSet(L"ScheduleSummary", ScheduleText() + L":  " + from + L"  →  " + to + (fire.empty() ? L"" : L"  +  Firebox " + fire));
     return L"Schedule saved.";
 }
-static std::wstring CliCommand(const std::wstring& from, const std::wstring& to) {
+static std::wstring CliCommand(const std::wstring& from, const std::wstring& to, const std::wstring& fire) {
     std::wstring exe = Join(g_exeDir, L"EntropyBackupCLI.exe");
     if (!Exists(exe)) {
         wchar_t e[MAX_PATH];
         GetModuleFileNameW(nullptr, e, MAX_PATH);
         exe = e;
     }
-    return QuoteArg(exe) + L" backup --from " + QuoteArg(from.empty() ? L"<project folder>" : from) + L" --to " + QuoteArg(to.empty() ? L"<backup folder>" : to);
+    return QuoteArg(exe) + L" backup --from " + QuoteArg(from.empty() ? L"<project folder>" : from) + L" --to " + QuoteArg(to.empty() ? L"<backup folder>" : to) +
+           (fire.empty() ? L"" : L" --firebox " + QuoteArg(fire));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1733,12 +1888,13 @@ enum Id {
     ID_BACKUP, ID_CANCEL, ID_HIST_MENU, ID_OPEN_VERSIONS, ID_H_OPEN, ID_H_RESTORE, ID_R_BROWSE, ID_R_OVERWRITE, ID_R_GO, ID_R_EXPLORE,
     ID_S_REMEMBER, ID_S_HIDDEN, ID_S_BG_PICK, ID_S_BG_RESET, ID_S_BANNER, ID_S_TINT, ID_S_FROST, ID_S_LOOK_RESET, ID_S_OPENDIR, ID_X_DEFAULTS, ID_X_SAVE, ID_A_DATA,
     ID_CAP_MIN, ID_CAP_MAX, ID_CAP_CLOSE, ID_S_OUTLINE, ID_S_COLA, ID_S_COLB, ID_S_SWAP, ID_S_SPAN, ID_S_OWIDTH, ID_S_OGLOW,
-    ID_H_VERIFY, ID_AU_APPLY, ID_AU_VSS, ID_AU_SUMS, ID_AU_VERIFY, ID_AU_COPY,
+    ID_H_VERIFY, ID_AU_APPLY, ID_AU_VSS, ID_AU_SUMS, ID_AU_VERIFY, ID_AU_COPY, ID_CHK_FIRE, ID_BROWSE_FIRE, ID_VIEW_PRIMARY, ID_VIEW_FIRE,
     ID_S_STYLE = 900, ID_AU_FREQ = 920, ID_AU_DAY = 930, ID_CARD = 1000, ID_LIST = 3000
 };
-enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL, IDC_TIME, IDC_KEEP, IDC_DAYS };
+enum { IDC_FROM = 101, IDC_TO, IDC_DESC, IDC_RTARGET, IDC_EXCL, IDC_TIME, IDC_KEEP, IDC_DAYS, IDC_FIRE };
 static int page = PG_BACKUP, hoverId = 0, pressId = 0, dragId = 0;
-static HWND editFrom{}, editTo{}, editDesc{}, editRestore{}, editExcl{}, editTime{}, editKeep{}, editDays{};
+static HWND editFrom{}, editTo{}, editDesc{}, editRestore{}, editExcl{}, editTime{}, editKeep{}, editDays{}, editFire{};
+static std::wstring fireNote;  // warning under the Firebox field (same drive as the backup folder, or an invalid pair)
 static HFONT editFont{};
 static int editFontH = 0;
 static HBRUSH fieldBrush{};
@@ -1991,21 +2147,31 @@ static void DrawHeader() {
     StrokeRR(box, 12, SB(C(0xC9D9EA, 0.22f)).Get(), 1);
     Text(L"Keep your projects safe.\nFocus on building.", RC(892, 72, 1086, 126), 14.5f, C(0xD5DEE8), REG, LEFT, true, VMID);
 }
+// Rows of the Backup page. Firebox mode adds a third folder row, so the rows tighten to make room for it.
+struct BackupRows { float from, to, fire, desc, fieldH, descH; };
+static BackupRows Rows() { return cfg.fireOn ? BackupRows{170, 254, 338, 422, 40, 44} : BackupRows{176, 281, 0, 386, 44, 70}; }
+static const UINT32 FLAME = 0xFFA45C;
 static void DrawBackupPage() {
     Glass(PagePanel(), 22, false);
     D2D1_COLOR_F gold = C(0xEBC56C);
-    Icon(IC_FOLDER, 380, 216, 32, gold);
-    LabelPair(L"From", L"(Source Directory)", 422, 176);
-    Field(RC(422, 196, 938, 240), editFrom);
-    Button(ID_BROWSE_FROM, RC(952, 196, 1086, 240), L"Browse", BS_SECOND, IC_FOLDER);
-    Icon(IC_DRIVE, 380, 321, 32, gold);
-    LabelPair(L"To", L"(Backup Directory)", 422, 281);
-    Field(RC(422, 301, 938, 345), editTo);
-    Button(ID_BROWSE_TO, RC(952, 301, 1086, 345), L"Browse", BS_SECOND, IC_FOLDER);
-    Icon(IC_DOC, 380, 432, 32, gold);
-    LabelPair(L"Description", L"(optional)", 422, 386);
-    Field(RC(422, 406, 1086, 476), editDesc);
-    Text(std::to_wstring(GetWindowTextLengthW(editDesc)) + L" / 500", RC(900, 478, 1086, 500), 13, C(0x9CB0C5), REG, RIGHT);
+    BackupRows w = Rows();
+    auto folderRow = [&](float y, int ic, D2D1_COLOR_F icc, const wchar_t* label, const wchar_t* sub, HWND e, int browse) {
+        Icon(ic, 380, y + 20 + w.fieldH / 2 - 2, 32, icc);
+        LabelPair(label, sub, 422, y);
+        Field(RC(422, y + 20, 938, y + 20 + w.fieldH), e);
+        Button(browse, RC(952, y + 20, 1086, y + 20 + w.fieldH), L"Browse", BS_SECOND, IC_FOLDER);
+    };
+    folderRow(w.from, IC_FOLDER, gold, L"From", L"(Source Directory)", editFrom, ID_BROWSE_FROM);
+    folderRow(w.to, IC_DRIVE, gold, L"To", L"(Backup Directory)", editTo, ID_BROWSE_TO);
+    Check(ID_CHK_FIRE, 930, w.to, L"Firebox mode", cfg.fireOn, true, 15);
+    if (cfg.fireOn) {
+        folderRow(w.fire, IC_FLAME, C(FLAME), L"Firebox", L"(Second, independent backup)", editFire, ID_BROWSE_FIRE);
+        if (!fireNote.empty()) Text(fireNote, RC(700, w.fire - 12, 1086, w.fire + 12), 13.5f, C(FLAME), SEMI, RIGHT);
+    }
+    Icon(IC_DOC, 380, w.desc + 20 + std::min(w.descH, 50.f) / 2, 32, gold);
+    LabelPair(L"Description", L"(optional)", 422, w.desc);
+    Field(RC(422, w.desc + 20, 1086, w.desc + 20 + w.descH), editDesc);
+    Text(std::to_wstring(GetWindowTextLengthW(editDesc)) + L" / 500", RC(900, w.desc + 22 + w.descH, 1086, w.desc + 44 + w.descH), 13, C(0x9CB0C5), REG, RIGHT);
 
     auto box = RC(356, 512, 1088, 732);
     FillRR(box, 14, SB(C(0x081426, 0.32f)).Get());
@@ -2028,14 +2194,25 @@ static void DetailRow(float& y, const std::wstring& label, const std::wstring& v
     y += 21.f * lines + 9;
 }
 static void EmptyList(D2D1_RECT_F area) {
-    Text(cfg.to.empty() ? L"No backup directory selected." : L"No snapshots yet.", RC(area.left, area.top + 6, area.right, area.top + 34), 17, C(0xD6E0EA), SEMI);
-    Text(cfg.to.empty() ? L"Choose a backup directory on the Backup page to see its versions."
-                        : L"Run your first backup and it will appear here.",
+    bool none = ViewDest().empty();
+    Text(none ? L"No backup directory selected." : L"No snapshots yet.", RC(area.left, area.top + 6, area.right, area.top + 34), 17, C(0xD6E0EA), SEMI);
+    Text(none ? L"Choose a backup directory on the Backup page to see its versions."
+              : viewFire ? L"The Firebox has no snapshots yet, or its drive is not connected."
+                         : L"Run your first backup and it will appear here.",
          RC(area.left, area.top + 38, area.right, area.top + 90), 14.5f, C(0x9CB0C5), REG, LEFT, true, VTOP);
+}
+static void Chip(int id, D2D1_RECT_F r, const std::wstring& label, bool on, bool en);
+// Primary | Firebox switch above the History and Restore lists. Returns the list area below it.
+static D2D1_RECT_F ViewSwitch(D2D1_RECT_F list) {
+    if (!FireboxSet()) return list;
+    Chip(ID_VIEW_PRIMARY, RC(list.left, list.top - 4, list.left + 120, list.top + 26), L"Primary", !viewFire, true);
+    Chip(ID_VIEW_FIRE, RC(list.left + 128, list.top - 4, list.left + 248, list.top + 26), L"Firebox", viewFire, true);
+    Text(viewFire ? cfg.fire : cfg.to, RC(list.left + 258, list.top - 4, list.right, list.top + 26), 12.5f, C(0x9CB0C5));
+    return RC(list.left, list.top + 40, list.right, list.bottom);
 }
 static void DrawHistoryPage() {
     Glass(PagePanel(), 22, false);
-    auto list = RC(356, 164, 690, 734);
+    auto list = ViewSwitch(RC(356, 164, 690, 734));
     zoneList = ToPx(list);
     if (snaps.empty()) { EmptyList(list); return; }
     SnapCards(list, listScroll, ID_LIST, 72, false);
@@ -2046,7 +2223,8 @@ static void DrawHistoryPage() {
     float y = 232;
     DetailRow(y, L"Description", s.desc, 3);
     DetailRow(y, L"Source", s.source, 2);
-    DetailRow(y, L"Type", s.type.empty() ? L"" : (s.type == L"full" ? L"Full copy" : L"Incremental") + std::wstring(s.shadow ? L"  \u00B7  shadow copy" : L""));
+    DetailRow(y, L"Type", s.type.empty() ? L"" : (s.type == L"full" ? L"Full copy" : L"Incremental") + std::wstring(s.shadow ? L"  \u00B7  shadow copy" : L"") +
+                              std::wstring(s.firebox ? L"  \u00B7  Firebox" : L""));
     DetailRow(y, L"Files", s.files ? Num(s.files) : L"");
     DetailRow(y, L"Copied", s.created.empty() ? L"" : Num(s.copied));
     DetailRow(y, L"Unchanged", s.created.empty() ? L"" : Num(s.reused) + L" (linked)");
@@ -2063,7 +2241,7 @@ static void DrawHistoryPage() {
 }
 static void DrawRestorePage() {
     Glass(PagePanel(), 22, false);
-    auto list = RC(356, 164, 690, 734);
+    auto list = ViewSwitch(RC(356, 164, 690, 734));
     zoneList = ToPx(list);
     if (snaps.empty()) EmptyList(list);
     else SnapCards(list, listScroll, ID_LIST, 72, false);
@@ -2148,7 +2326,7 @@ static void DrawAutomationPage() {
 
     Text(L"Command Line", RC(360, 648, 700, 678), 18, gold, SEMI);
     Button(ID_AU_COPY, RC(938, 646, 1088, 678), L"Copy", BS_GHOST, IC_DOC, false, true, 14);
-    Text(CliCommand(EditText(editFrom), NormPath(EditText(editTo))), RC(362, 684, 1088, 734), 13, C(0xC8D4E2), REG, LEFT, true, VTOP);
+    Text(CliCommand(EditText(editFrom), NormPath(EditText(editTo)), cfg.fireOn ? NormPath(EditText(editFire)) : L""), RC(362, 684, 1088, 734), 13, C(0xC8D4E2), REG, LEFT, true, VTOP);
 }
 static void DrawSettingsPage() {
     Glass(PagePanel(), 22, false);
@@ -2273,16 +2451,22 @@ static void DrawProgress() {
         {L"Ready to back up", L"Scanning project...", L"Backing up files...", L"Finalizing snapshot...", L"Backup complete", L"Backup failed", L"Backup cancelled"},
         {L"Ready to back up", L"Preparing restore...", L"Restoring files...", L"Finalizing...", L"Restore complete", L"Restore failed", L"Restore cancelled"},
         {L"Ready to back up", L"Preparing verification...", L"Verifying checksums...", L"Finalizing...", L"Verification passed", L"Verification failed", L"Verification cancelled"}};
-    const wchar_t* title = ph == 4 && kind == 2 && job.warnings ? L"Verification found problems" : titles[kind][std::clamp(ph, 0, 6)];
-    bool bad = ph == 5 || (ph == 4 && kind == 2 && job.warnings);
+    std::wstring title = ph == 4 && kind == 2 && job.warnings ? L"Verification found problems" : titles[kind][std::clamp(ph, 0, 6)];
+    bool two = kind == 0 && job.legs == 2, partial = kind == 0 && ph == 4 && job.failedLegs;
+    if (partial) title = L"Backup incomplete \u2014 one destination failed";
+    else if (two && ph == 4) title = L"Backup complete \u00B7 both copies saved";
+    else if (two && (ph == 2 || ph == 3)) title += job.leg == 1 ? L"  \u00B7  Firebox 2/2" : L"  \u00B7  Primary 1/2";
+    bool bad = ph == 5 || partial || (ph == 4 && kind == 2 && job.warnings);
     Text(title, cb ? RC(ox, 782, 950, 810) : RC(ox, 726, 950, 758), cb ? 20.f : 22.f, bad ? C(0xFF9C8A) : C(0xF7F9FC), SEMI);
     std::wstring line = msg;
     if (ph == 0 && GetWindowTextLengthW(editFrom) && GetWindowTextLengthW(editTo) && msg == IDLE_MESSAGE)
         line = L"Folders are set. Press Back Up Now to create a snapshot.";
     if (ph == 1) line = cur.rfind(L"Creating", 0) == 0 ? cur : L"Scanning: " + cur;
-    else if (ph == 2) line = kind == 2 ? cur : (rest ? L"Restoring: " : L"Copying: ") + cur;
+    else if (ph == 2) line = kind == 2 ? cur : (rest ? L"Restoring: " : two && job.leg == 1 ? L"Copying to Firebox: " : L"Copying: ") + cur;
     else if (ph == 3) line = cur.empty() ? L"Writing manifest and metadata..." : cur;
-    Text(line, cb ? RC(ox, 810, 950, 836) : RC(ox, 760, 950, 786), 15.5f, C(0xB5C5D5));
+    if (two && ph >= 4)  // two destinations: the result has a clause for each, so it may wrap onto a second line
+        Text(line, cb ? RC(ox, 808, 950, 844) : RC(ox, 758, 950, 800), 13.5f, C(0xB5C5D5), REG, LEFT, true, VTOP);
+    else Text(line, cb ? RC(ox, 810, 950, 836) : RC(ox, 760, 950, 786), 15.5f, C(0xB5C5D5));
     Button(ID_CANCEL, cb ? RC(962, 786, 1088, 828) : RC(962, 728, 1088, 770), L"Cancel", BS_GHOST, IC_STOP, false, run && !job.cancel, 15);
 
     auto bar = cb ? RC(ox, 846, 1088, 856) : RC(ox, 806, 1088, 816);
@@ -2307,8 +2491,9 @@ static void DrawProgress() {
 static void DrawHistoryPanel() {
     float hb = cfg.banner ? 756.f : 686.f;
     Glass(RC(1126, 58, 1466, hb), 22, false);
-    Icon(IC_HISTHDR, 1160, 104, 26, C(0xD8E2EE));
-    Text(L"Version History", RC(1186, 88, 1400, 120), 20, C(0xF4F7FA), SEMI);
+    bool fv = viewFire && FireboxSet();
+    Icon(fv ? IC_FLAME : IC_HISTHDR, 1160, 104, 26, fv ? C(FLAME) : C(0xD8E2EE));
+    Text(fv ? L"Firebox History" : L"Version History", RC(1186, 88, 1400, 120), 20, C(0xF4F7FA), SEMI);
     auto dots = RC(1412, 88, 1450, 120);
     if (hoverId == ID_HIST_MENU) FillRR(dots, 8, SB(C(0xFFFFFF, 0.10f)).Get());
     Icon(IC_DOTS, 1431, 104, 22, C(0xE6EDF5));
@@ -2316,7 +2501,7 @@ static void DrawHistoryPanel() {
     auto area = RC(1142, 136, 1450, hb - 14);
     zoneCards = ToPx(area);
     if (snaps.empty()) {
-        Text(cfg.to.empty() ? L"No backup directory selected." : L"No snapshots yet.", RC(1146, 140, 1450, 168), 16, C(0xA9BACC));
+        Text(ViewDest().empty() ? L"No backup directory selected." : L"No snapshots yet.", RC(1146, 140, 1450, 168), 16, C(0xA9BACC));
         return;
     }
     SnapCards(area, cardScroll, ID_CARD, 74, true);
@@ -2436,9 +2621,17 @@ static void Paint() {
 // ---------------------------------------------------------------------------------------------
 // Child edit controls
 // ---------------------------------------------------------------------------------------------
+// Re-checks the Firebox against the backup folder; shown in the Firebox row.
+static void CheckFirebox() {
+    fireNote.clear();
+    if (!cfg.fireOn || cfg.fire.empty() || cfg.to.empty()) return;
+    fireNote = FireboxConflict(cfg.to, cfg.fire);
+    if (fireNote.empty() && SameDrive(cfg.to, cfg.fire)) fireNote = L"\u26A0 Same drive as To \u2014 not a real second copy";
+}
 static void ReadEdits() {
     cfg.from = EditText(editFrom);
     cfg.to = NormPath(EditText(editTo));
+    cfg.fire = NormPath(EditText(editFire));
     cfg.excludes = EditText(editExcl);
     cfg.keepCount = std::clamp(_wtoi(EditText(editKeep).c_str()), 0, 99999);
     cfg.keepDays = std::clamp(_wtoi(EditText(editDays).c_str()), 0, 99999);
@@ -2459,6 +2652,7 @@ static void ShowControls() {
     ShowWindow(editFrom, page == PG_BACKUP ? SW_SHOW : SW_HIDE);
     ShowWindow(editTo, page == PG_BACKUP ? SW_SHOW : SW_HIDE);
     ShowWindow(editDesc, page == PG_BACKUP ? SW_SHOW : SW_HIDE);
+    ShowWindow(editFire, page == PG_BACKUP && cfg.fireOn ? SW_SHOW : SW_HIDE);
     ShowWindow(editRestore, page == PG_RESTORE ? SW_SHOW : SW_HIDE);
     ShowWindow(editExcl, page == PG_EXCLUDES ? SW_SHOW : SW_HIDE);
     for (HWND e : {editTime, editKeep, editDays}) ShowWindow(e, page == PG_AUTO ? SW_SHOW : SW_HIDE);
@@ -2472,15 +2666,18 @@ static void LayoutControls() {
     int fh = -(int)lroundf(16 * gs);
     if (fh != editFontH) {
         HFONT f = CreateFontW(fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-        for (HWND e : {editFrom, editTo, editDesc, editRestore, editExcl, editTime, editKeep, editDays}) SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
+        for (HWND e : {editFrom, editTo, editDesc, editRestore, editExcl, editTime, editKeep, editDays, editFire}) SendMessageW(e, WM_SETFONT, (WPARAM)f, TRUE);
         if (editFont) DeleteObject(editFont);
         editFont = f;
         editFontH = fh;
     }
     pageDy = PageDy();
-    PlaceEdit(editFrom, RC(436, 207, 926, 231));
-    PlaceEdit(editTo, RC(436, 312, 926, 336));
-    PlaceEdit(editDesc, RC(436, 416, 1074, 468));
+    BackupRows w = Rows();
+    float pad = (w.fieldH - 24) / 2;  // single-line fields: 24 units of text, centred in the field
+    PlaceEdit(editFrom, RC(436, w.from + 21 + pad, 926, w.from + 45 + pad));
+    PlaceEdit(editTo, RC(436, w.to + 21 + pad, 926, w.to + 45 + pad));
+    PlaceEdit(editFire, RC(436, w.fire + 21 + pad, 926, w.fire + 45 + pad));
+    PlaceEdit(editDesc, RC(436, w.desc + 30, 1074, w.desc + 12 + w.descH));
     PlaceEdit(editRestore, RC(732, 324, 1076, 348));
     PlaceEdit(editExcl, RC(368, 252, 1080, 656));
     PlaceEdit(editTime, RC(530, 240, 600, 262));
@@ -2541,6 +2738,8 @@ static void ResetJob(int kind, const std::wstring& title) {
     job.kind = kind;
     job.cancel = false;
     job.scanned = job.copied = job.linked = job.skipped = job.bytesWritten = job.workDone = job.workTotal = job.warnings = 0;
+    job.legs = 1;
+    job.leg = job.failedLegs = 0;
     {
         std::lock_guard l(job.m);
         job.t0 = job.t1 = std::chrono::steady_clock::now();
@@ -2555,9 +2754,12 @@ static void StartBackup() {
     ReadEdits();
     if (cfg.from.empty() || cfg.to.empty()) { Notify(L"Choose both From and To directories first."); return; }
     SaveSettings();
+    if (cfg.fireOn && cfg.fire.empty()) { Notify(L"Choose a Firebox folder, or turn Firebox mode off."); return; }
+    std::wstring fire = cfg.fireOn ? cfg.fire : L"";
+    if (!fire.empty() && !FireboxConflict(cfg.to, fire).empty()) { Notify(FireboxConflict(cfg.to, fire)); return; }
     BackupParams p{cfg.from, cfg.to, EditText(editDesc), cfg.full, cfg.hardLinks, cfg.preserve, cfg.versioned, cfg.skipHidden, Patterns(cfg.excludes),
-                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays};
-    ResetJob(0, L"Backup " + NormPath(cfg.from) + L" -> " + cfg.to);
+                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays, fire};
+    ResetJob(0, L"Backup " + NormPath(cfg.from) + L" -> " + cfg.to + (fire.empty() ? L"" : L" + Firebox " + fire));
     worker = std::thread(BackupWorker, p);
 }
 static void StartVerify() {
@@ -2601,7 +2803,8 @@ static void HistoryMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, 1, L"Refresh");
     AppendMenuW(m, MF_STRING, 2, L"Show All Versions");
-    AppendMenuW(m, MF_STRING | (cfg.to.empty() ? MF_GRAYED : 0), 3, L"Open Versions Folder");
+    AppendMenuW(m, MF_STRING | (ViewDest().empty() ? MF_GRAYED : 0), 3, L"Open Versions Folder");
+    if (FireboxSet()) AppendMenuW(m, MF_STRING, 4, viewFire ? L"Show Primary Versions" : L"Show Firebox Versions");
     auto r = ToPx(RC(1412, 88, 1450, 120));
     POINT pt{(LONG)r.left, (LONG)r.bottom};
     ClientToScreen(g_hwnd, &pt);
@@ -2610,6 +2813,7 @@ static void HistoryMenu() {
     if (cmd == 1) { ReadEdits(); RefreshHistory(); }
     else if (cmd == 2) GoPage(PG_HISTORY);
     else if (cmd == 3) { std::wstring root = VersionsRoot(); MakeDirs(root); OpenFolder(root); }
+    else if (cmd == 4) { viewFire = !viewFire; selSnap = cardScroll = listScroll = 0; RefreshHistory(); }
 }
 static void DragSlider(float x) {
     for (auto& hs : hots)
@@ -2643,9 +2847,31 @@ static void OnClick(int id) {
     case ID_BROWSE_FROM: { auto q = PickFolder(g_hwnd, EditText(editFrom)); if (!q.empty()) SetWindowTextW(editFrom, q.c_str()); break; }
     case ID_BROWSE_TO: {
         auto q = PickFolder(g_hwnd, EditText(editTo));
-        if (!q.empty()) { SetWindowTextW(editTo, q.c_str()); KillTimer(g_hwnd, T_HIST); ReadEdits(); RefreshHistory(); SaveSettings(); }
+        if (!q.empty()) { SetWindowTextW(editTo, q.c_str()); KillTimer(g_hwnd, T_HIST); ReadEdits(); CheckFirebox(); RefreshHistory(); SaveSettings(); }
         break;
     }
+    case ID_BROWSE_FIRE: {
+        auto q = PickFolder(g_hwnd, EditText(editFire));
+        if (!q.empty()) { SetWindowTextW(editFire, q.c_str()); KillTimer(g_hwnd, T_HIST); ReadEdits(); CheckFirebox(); RefreshHistory(); SaveSettings(); }
+        break;
+    }
+    case ID_CHK_FIRE:
+        ReadEdits();
+        cfg.fireOn = !cfg.fireOn;
+        if (!cfg.fireOn) viewFire = false;
+        CheckFirebox();
+        SaveSettings();
+        LayoutControls();
+        RefreshHistory();
+        if (cfg.fireOn && cfg.fire.empty()) SetFocus(editFire);
+        break;
+    case ID_VIEW_PRIMARY:
+    case ID_VIEW_FIRE:
+        ReadEdits();
+        viewFire = id == ID_VIEW_FIRE;
+        selSnap = cardScroll = listScroll = 0;
+        RefreshHistory();
+        break;
     case ID_RADIO_INC: cfg.full = false; SaveSettings(); break;
     case ID_RADIO_FULL: cfg.full = true; SaveSettings(); break;
     case ID_CHK_LINK: cfg.hardLinks = !cfg.hardLinks; SaveSettings(); break;
@@ -2657,7 +2883,7 @@ static void OnClick(int id) {
     case ID_HIST_MENU: HistoryMenu(); break;
     case ID_OPEN_VERSIONS: {
         ReadEdits();
-        if (cfg.to.empty()) { Notify(L"Choose a backup directory first."); break; }
+        if (ViewDest().empty()) { Notify(L"Choose a backup directory first."); break; }
         std::wstring root = VersionsRoot();
         MakeDirs(root);
         OpenFolder(root);
@@ -2676,7 +2902,7 @@ static void OnClick(int id) {
     case ID_AU_VSS: cfg.shadow = !cfg.shadow; SaveSettings(); break;
     case ID_AU_SUMS: cfg.checksums = !cfg.checksums; SaveSettings(); break;
     case ID_AU_VERIFY: cfg.verifyAfter = !cfg.verifyAfter; SaveSettings(); break;
-    case ID_AU_COPY: CopyText(CliCommand(EditText(editFrom), NormPath(EditText(editTo)))); flash = L"Command copied."; break;
+    case ID_AU_COPY: CopyText(CliCommand(EditText(editFrom), NormPath(EditText(editTo)), cfg.fireOn ? NormPath(EditText(editFire)) : L"")); flash = L"Command copied."; break;
     case ID_R_EXPLORE: if (!snaps.empty()) OpenFolder(Join(snaps[std::clamp(selSnap, 0, (int)snaps.size() - 1)].dir, L"files")); break;
     case ID_R_BROWSE: { auto q = PickFolder(g_hwnd, EditText(editRestore)); if (!q.empty()) SetWindowTextW(editRestore, q.c_str()); break; }
     case ID_R_OVERWRITE: cfg.overwrite = !cfg.overwrite; SaveSettings(); break;
@@ -2734,13 +2960,16 @@ Usage: EntropyBackupCLI <command> [options]
 Commands
   backup          Create a snapshot of --from inside --to
   verify [ID]     Check a snapshot against its SHA-256 checksums (default: the newest)
-  prune           Apply the retention rules (--keep / --keep-days) now
-  list            List the snapshots in --to
+  prune           Apply the retention rules (--keep / --keep-days) now, to --to and the Firebox
+  list            List the snapshots in --to (give the Firebox folder as --to to list it)
   help            Show this text
 
 Options (anything not given comes from the app's saved settings)
   --from DIR      Project folder to back up
   --to DIR        Backup folder; snapshots go in DIR\EntropyBackup_Versions
+  --firebox DIR   Firebox mode: also back up to DIR, a second, independent
+                  destination (another drive, a NAS, off-site)  (--no-firebox)
+                  If one destination fails, the other is still saved (exit 1).
   --desc TEXT     Description stored with the snapshot
   --full          Full copy instead of incremental      (--incremental to force)
   --mirror        Keep one mirror_latest instead of versioned snapshots
@@ -2794,7 +3023,7 @@ static int RunCli(const std::vector<std::wstring>& a) {
     std::wstring cmd = a.empty() ? L"help" : Lower(a[0]);
     while (!cmd.empty() && (cmd[0] == L'-' || cmd[0] == L'/')) cmd.erase(0, 1);
     BackupParams P{cfg.from, cfg.to, L"", cfg.full, cfg.hardLinks, cfg.preserve, cfg.versioned, cfg.skipHidden, Patterns(cfg.excludes),
-                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays};
+                   cfg.shadow, cfg.checksums, cfg.verifyAfter && cfg.checksums, cfg.keepCount, cfg.keepDays, FireboxSet() ? cfg.fire : L""};
     bool scheduled = false;
     std::wstring snapArg;
     auto bad = [](const std::wstring& m) { Out(L"Error: " + m + L"\nRun EntropyBackupCLI help for usage.\n"); return 3; };
@@ -2809,6 +3038,8 @@ static int RunCli(const std::vector<std::wstring>& a) {
         };
         if (o == L"--from" && val) P.src = a[++i];
         else if (o == L"--to" && val) P.dst = a[++i];
+        else if (o == L"--firebox" && val) P.fire = a[++i];
+        else if (o == L"--no-firebox") P.fire.clear();
         else if ((o == L"--desc" || o == L"--description") && val) P.desc = a[++i];
         else if (o == L"--exclude" && val) { for (auto& x : Patterns(a[++i])) P.patterns.push_back(x); }
         else if (o == L"--log" && val) g_logPath = NormPath(a[++i]);
@@ -2840,27 +3071,38 @@ static int RunCli(const std::vector<std::wstring>& a) {
         if (P.src.empty()) return bad(L"--from is required.");
         if (P.desc.empty() && scheduled) P.desc = L"Scheduled backup";
         std::wstring src = NormPath(P.src);
-        ResetJob(0, (scheduled ? L"Scheduled backup " : L"Backup ") + src + L" -> " + dst);
+        ResetJob(0, (scheduled ? L"Scheduled backup " : L"Backup ") + src + L" -> " + dst + (P.fire.empty() ? L"" : L" + Firebox " + NormPath(P.fire)));
+        if (!P.fire.empty()) {
+            std::wstring why = FireboxConflict(dst, P.fire);
+            if (!why.empty()) return bad(why);
+        }
         Out(L"Backing up " + src + L" to " + root + L"\n");
+        if (!P.fire.empty()) Out(L"Firebox:   " + Join(NormPath(P.fire), L"EntropyBackup_Versions") + L"\n");
         worker = std::thread(BackupWorker, P);
         return WaitJob();
     }
     if (cmd == L"prune") {
         if (!P.keep && !P.keepDays) return bad(L"give --keep or --keep-days (or set retention in the app).");
-        try {
-            VersionsLock lock(root);
-            int n = Prune(root, P.keep, P.keepDays);
-            std::wstring msg = L"Removed " + Num(n) + (n == 1 ? L" old snapshot." : L" old snapshots.");
-            LogEvent(L"Prune " + root + L" | OK | " + msg);
-            Out(msg + L"\n");
-            return 0;
-        } catch (const Fail& f) {
-            LogEvent(L"Prune " + root + L" | FAILED | " + f.msg);
-            Out(L"Error: " + f.msg + L"\n");
-            return 2;
+        std::vector<std::wstring> roots{root};
+        if (!P.fire.empty()) roots.push_back(Join(NormPath(P.fire), L"EntropyBackup_Versions"));
+        int rc = 0;
+        for (auto& r : roots) {
+            try {
+                VersionsLock lock(r);
+                int n = Prune(r, P.keep, P.keepDays);
+                std::wstring msg = L"Removed " + Num(n) + (n == 1 ? L" old snapshot" : L" old snapshots") + L" from " + r + L".";
+                LogEvent(L"Prune " + r + L" | OK | " + msg);
+                Out(msg + L"\n");
+            } catch (const Fail& f) {
+                LogEvent(L"Prune " + r + L" | FAILED | " + f.msg);
+                Out(L"Error: " + r + L": " + f.msg + L"\n");
+                rc = 2;
+            }
         }
+        return rc;
     }
     cfg.to = dst;
+    viewFire = false;
     RefreshHistory();
     if (cmd == L"list") {
         if (snaps.empty()) { Out(L"No snapshots in " + root + L"\n"); return 0; }
@@ -2898,6 +3140,7 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         fieldBrush = CreateSolidBrush(FIELD_GDI);
         editFrom = MakeEdit(h, IDC_FROM, ES_AUTOHSCROLL, L"Select the project folder to protect");
         editTo = MakeEdit(h, IDC_TO, ES_AUTOHSCROLL, L"Select a backup folder, ideally on another drive");
+        editFire = MakeEdit(h, IDC_FIRE, ES_AUTOHSCROLL, L"Select a second backup folder on another drive, NAS or off-site location");
         editDesc = MakeEdit(h, IDC_DESC, ES_MULTILINE | ES_AUTOVSCROLL, nullptr);
         editRestore = MakeEdit(h, IDC_RTARGET, ES_AUTOHSCROLL, L"Select an empty folder to restore into");
         editExcl = MakeEdit(h, IDC_EXCL, ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL, nullptr);
@@ -2915,7 +3158,9 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         SendMessageW(editDesc, EM_SETLIMITTEXT, 500, 0);
         SetWindowTextW(editFrom, cfg.from.c_str());
         SetWindowTextW(editTo, cfg.to.c_str());
+        SetWindowTextW(editFire, cfg.fire.c_str());
         SetWindowTextW(editExcl, cfg.excludes.c_str());
+        CheckFirebox();
         RefreshHistory();
         LayoutControls();
         return 0;
@@ -3002,14 +3247,14 @@ static LRESULT CALLBACK Wnd(HWND h, UINT m, WPARAM w, LPARAM l) {
         int code = HIWORD(w), id = LOWORD(w);
         if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(h, nullptr, FALSE);
         if (code == EN_CHANGE) {
-            if (id == IDC_TO) SetTimer(h, T_HIST, 450, nullptr);
+            if (id == IDC_TO || id == IDC_FIRE) SetTimer(h, T_HIST, 450, nullptr);
             if (id == IDC_EXCL || id == IDC_TIME) flash.clear();
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
     }
     case WM_TIMER:
-        if (w == T_HIST) { KillTimer(h, T_HIST); ReadEdits(); RefreshHistory(); }
+        if (w == T_HIST) { KillTimer(h, T_HIST); ReadEdits(); CheckFirebox(); RefreshHistory(); }
         InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_APP_JOBDONE: {

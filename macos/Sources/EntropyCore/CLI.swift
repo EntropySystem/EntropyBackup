@@ -12,13 +12,16 @@ public enum CLI {
         Commands
           backup          Create a snapshot of --from inside --to
           verify [ID]     Check a snapshot against its SHA-256 checksums (default: the newest)
-          prune           Apply the retention rules (--keep / --keep-days) now
-          list            List the snapshots in --to
+          prune           Apply the retention rules (--keep / --keep-days) now, to --to and the Firebox
+          list            List the snapshots in --to (give the Firebox folder as --to to list it)
           help            Show this text
 
         Options (anything not given comes from the app's saved settings)
           --from DIR      Project folder to back up
           --to DIR        Backup folder; snapshots go in DIR/EntropyBackup_Versions
+          --firebox DIR   Firebox mode: also back up to DIR, a second, independent
+                          destination (another drive, a NAS, off-site)  (--no-firebox)
+                          If one destination fails, the other is still saved (exit 1).
           --desc TEXT     Description stored with the snapshot
           --full          Full copy instead of incremental      (--incremental to force)
           --mirror        Keep one mirror_latest instead of versioned snapshots
@@ -77,6 +80,8 @@ public enum CLI {
             switch k {
             case "--from" where hasValue: o.src = value()
             case "--to" where hasValue: o.dst = value()
+            case "--firebox" where hasValue: o.fire = value()
+            case "--no-firebox": o.fire = ""
             case "--desc" where hasValue, "--description" where hasValue: o.desc = value()
             case "--exclude" where hasValue: o.patterns += Excludes.patterns(value())
             case "--log" where hasValue: Log.path = normPath(value())
@@ -107,25 +112,32 @@ public enum CLI {
         case "backup":
             guard !o.src.isEmpty else { return bad("--from is required.") }
             if o.desc.isEmpty && scheduled { o.desc = "Scheduled backup" }
-            let job = Job(.backup, title: (scheduled ? "Scheduled backup " : "Backup ") + normPath(o.src) + " -> " + normPath(o.dst))
+            if !o.fire.isEmpty, let why = Engine.fireboxConflict(o.dst, o.fire) { return bad(why) }
+            let job = Job(.backup, title: (scheduled ? "Scheduled backup " : "Backup ") + normPath(o.src) + " -> " + normPath(o.dst)
+                + (o.fire.isEmpty ? "" : " + Firebox " + normPath(o.fire)))
             out("Backing up \(normPath(o.src)) to \(root)\n")
+            if !o.fire.isEmpty { out("Firebox:   \(Engine.versionsRoot(o.fire))\n") }
             let opts = o
             return wait(job) { Engine.backup(opts, job: job) }
         case "prune":
             guard o.keep > 0 || o.keepDays > 0 else { return bad("give --keep or --keep-days (or set retention in the app).") }
-            do {
-                let n = try Engine.pruneLocked(o.dst, keep: o.keep, keepDays: o.keepDays)
-                let msg = "Removed \(Format.num(n)) old snapshot\(n == 1 ? "" : "s")."
-                Log.event("Prune \(root) | OK | \(msg)")
-                out(msg + "\n")
-                return 0
-            } catch Stop.fail(let m) {
-                Log.event("Prune \(root) | FAILED | \(m)")
-                out("Error: \(m)\n")
-                return 2
-            } catch {
-                return 2
+            var rc: Int32 = 0
+            for dir in [o.dst, o.fire] where !dir.isEmpty {
+                let r = Engine.versionsRoot(dir)
+                do {
+                    let n = try Engine.pruneLocked(dir, keep: o.keep, keepDays: o.keepDays)
+                    let msg = "Removed \(Format.num(n)) old snapshot\(n == 1 ? "" : "s") from \(r)."
+                    Log.event("Prune \(r) | OK | \(msg)")
+                    out(msg + "\n")
+                } catch {
+                    var m = error.localizedDescription
+                    if let stop = error as? Stop, case .fail(let text) = stop { m = text }
+                    Log.event("Prune \(r) | FAILED | \(m)")
+                    out("Error: \(r): \(m)\n")
+                    rc = 2
+                }
             }
+            return rc
         case "list":
             let snaps = Snapshot.list(o.dst)
             if snaps.isEmpty { out("No snapshots in \(root)\n"); return 0 }

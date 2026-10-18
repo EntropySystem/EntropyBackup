@@ -160,7 +160,7 @@ struct FileItem {
     var reuse = false, failed = false, sha = ""
 }
 struct ScanOptions {
-    var patterns: [String] = [], skipHidden = false, skipDir = ""
+    var patterns: [String] = [], skipHidden = false, skipDirs: [String] = []
 }
 func scan(_ root: String, _ rel: String, _ o: ScanOptions, _ job: Job, _ files: inout [FileItem], _ dirs: inout [String]) {
     var subs: [String] = []
@@ -172,7 +172,7 @@ func scan(_ root: String, _ rel: String, _ o: ScanOptions, _ job: Job, _ files: 
         guard let st = lstatInfo(join(root, r)) else { continue }
         let type = st.st_mode & S_IFMT
         if type == S_IFDIR {  // symbolic links to folders are copied as links, never followed
-            if !o.skipDir.isEmpty && Excludes.key(join(root, r)) == o.skipDir { continue }
+            if !o.skipDirs.isEmpty && o.skipDirs.contains(Excludes.key(join(root, r))) { continue }
             dirs.append(r)
             subs.append(r)
         } else if type == S_IFREG || type == S_IFLNK {
@@ -202,12 +202,14 @@ public struct BackupOptions {
     public var full, hardLinks, preserve, versioned, skipHidden, checksums, verify: Bool
     public var patterns: [String]
     public var keep, keepDays: Int
+    public var fire: String  // Firebox: a second, independent destination ("" = Firebox mode off)
     public init(_ s: Settings, desc: String = "") {
         src = s.from; dst = s.to; self.desc = desc
         full = s.full; hardLinks = s.hardLinks; preserve = s.preserve; versioned = s.versioned; skipHidden = s.skipHidden
         checksums = s.checksums; verify = s.verifyAfter && s.checksums
         patterns = Excludes.patterns(s.excludes)
         keep = s.keepCount; keepDays = s.keepDays
+        fire = s.fireOn ? s.fire : ""
     }
 }
 public struct VerifyResult {
@@ -225,25 +227,66 @@ public struct VerifyResult {
 public enum Engine {
     public static func versionsRoot(_ to: String) -> String { join(normPath(to), "EntropyBackup_Versions") }
 
-    public static func backup(_ o: BackupOptions, job: Job) {
-        var work = ""
-        do {
-            let (msg, snapDir) = try runBackup(o, job, &work)
-            job.finish(.done, msg, path: snapDir)
-        } catch Stop.cancelled {
-            if !work.isEmpty { removeTree(work) }
-            job.finish(.cancelled, "Cancelled. No partial snapshot was kept.")
-        } catch Stop.fail(let m) {
-            if !work.isEmpty { removeTree(work) }
-            job.finish(.failed, m)
-        } catch {
-            if !work.isEmpty { removeTree(work) }
-            job.finish(.failed, error.localizedDescription)
+    /// Why `fire` cannot be the Firebox next to the backup folder `to`, or nil if the pair is fine.
+    public static func fireboxConflict(_ to: String, _ fire: String) -> String? {
+        let a = normPath(to), b = normPath(fire)
+        if Excludes.key(a) == Excludes.key(b) { return "The Firebox must be a different folder from the backup folder." }
+        if isUnder(b, versionsRoot(a)) || isUnder(a, versionsRoot(b)) { return "The Firebox cannot be inside the other destination's versions folder." }
+        return nil
+    }
+    /// True when both folders are on the same local volume, so a Firebox there would not survive losing that drive.
+    public static func sameVolume(_ a: String, _ b: String) -> Bool {
+        func volume(_ p: String) -> NSObject? {
+            var path = normPath(p)
+            while !path.isEmpty && path != "/" && lstatInfo(path) == nil { path = (path as NSString).deletingLastPathComponent }
+            guard !path.isEmpty, let v = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.volumeIdentifierKey, .volumeIsLocalKey]),
+                  v.volumeIsLocal != false else { return nil }
+            return v.volumeIdentifier as? NSObject
         }
+        guard let x = volume(a), let y = volume(b) else { return false }
+        return x.isEqual(y)
     }
 
-    private static func runBackup(_ o: BackupOptions, _ job: Job, _ work: inout String) throws -> (String, String) {
-        let src = normPath(o.src), dst = normPath(o.dst)
+    /// Backs up to the backup folder and, in Firebox mode, to the Firebox as well. Each destination gets its own
+    /// complete, independent snapshot chain, so either one can be lost. A destination that cannot be reached
+    /// (an unplugged drive, an offline NAS) is reported and the other is still saved.
+    public static func backup(_ o: BackupOptions, job: Job) {
+        var dests = [(name: "Primary", dst: o.dst, firebox: false)]
+        if !o.fire.isEmpty {
+            if let why = fireboxConflict(o.dst, o.fire) { job.finish(.failed, why); return }
+            dests.append((name: "Firebox", dst: o.fire, firebox: true))
+        }
+        let skip = dests.map { versionsRoot($0.dst) }, two = dests.count > 1
+        job.update { $0.legs = dests.count }
+        var parts: [String] = [], first = "", saved = 0
+        for (k, d) in dests.enumerated() {
+            job.update { $0.leg = k }
+            var work = ""
+            let pre = two ? d.name + ": " : ""
+            do {
+                let (msg, snapDir) = try runBackup(o, dst: d.dst, firebox: d.firebox, brief: two, skip: skip, job, &work)
+                parts.append(pre + msg)
+                saved += 1
+                if first.isEmpty { first = snapDir }
+            } catch Stop.cancelled {
+                if !work.isEmpty { removeTree(work) }
+                job.finish(.cancelled, saved > 0 ? "Cancelled. The primary snapshot was saved; the Firebox snapshot was not kept." : "Cancelled. No partial snapshot was kept.")
+                return
+            } catch {
+                if !work.isEmpty { removeTree(work) }
+                var m = error.localizedDescription
+                if let stop = error as? Stop, case .fail(let text) = stop { m = text }
+                if !two { job.finish(.failed, m); return }
+                parts.append(pre + "NOT SAVED. " + m)
+                job.update { $0.warnings += 1; $0.failedLegs += 1 }
+            }
+        }
+        if saved > 0 { job.finish(.done, parts.joined(separator: "  "), path: first) }
+        else { job.finish(.failed, parts.joined(separator: "  ")) }
+    }
+
+    private static func runBackup(_ o: BackupOptions, dst dstPath: String, firebox: Bool, brief: Bool, skip: [String], _ job: Job, _ work: inout String) throws -> (String, String) {
+        let src = normPath(o.src), dst = normPath(dstPath)
         guard isDir(src) else { throw Stop.fail("The source folder does not exist.") }
         let root = join(dst, "EntropyBackup_Versions")
         if Excludes.key(src) == Excludes.key(dst) { throw Stop.fail("Source and backup folders must be different.") }
@@ -251,6 +294,7 @@ public enum Engine {
         try makeDirs(root)
         let lock = try VersionsLock(root)
         defer { withExtendedLifetime(lock) {} }
+        let c0 = job.state  // counters before this destination, so a second destination reports only its own work
         // Leftovers of an interrupted run (power loss, killed process) are never valid snapshots.
         for n in names(root) where n.hasPrefix("incomplete_") { removeTree(join(root, n)) }
 
@@ -267,7 +311,7 @@ public enum Engine {
 
         // 1. Scan
         var opts = ScanOptions(patterns: o.patterns, skipHidden: o.skipHidden)
-        if isUnder(root, src) { opts.skipDir = Excludes.key(root) }  // never back up our own versions folder
+        opts.skipDirs = skip.filter { isUnder($0, src) }.map(Excludes.key)  // never back up our own versions folders
         var files: [FileItem] = [], dirs: [String] = []
         scan(src, "", opts, job, &files, &dirs)
         if job.isCancelled { throw Stop.cancelled }
@@ -368,14 +412,16 @@ public enum Engine {
         j += "  \"source\": \"\(Format.json(src))\",\n"
         j += "  \"description\": \"\(Format.json(o.desc))\",\n"
         j += "  \"type\": \"\(o.full ? "full" : "incremental")\",\n"
+        j += "  \"firebox\": \(firebox),\n"
         j += "  \"hard_links\": \(o.hardLinks && !o.full),\n"
         j += "  \"shadow_copy\": false,\n"
         j += "  \"checksums\": \(o.checksums),\n"
         j += "  \"previous\": \"\(Format.json(prev.isEmpty ? "" : (prev as NSString).lastPathComponent))\",\n"
         j += "  \"files\": \(files.count - failed),\n"
-        j += "  \"copied\": \(st.copied),\n"
-        j += "  \"reused\": \(st.linked),\n"
-        j += "  \"bytes_written\": \(st.bytesWritten),\n"
+        let copied = st.copied - c0.copied, linked = st.linked - c0.linked, written = st.bytesWritten - c0.bytesWritten
+        j += "  \"copied\": \(copied),\n"
+        j += "  \"reused\": \(linked),\n"
+        j += "  \"bytes_written\": \(written),\n"
         j += "  \"bytes_total\": \(totalBytes),\n"
         j += "  \"duration_seconds\": \(String(format: "%.1f", Date().timeIntervalSince(st.started))),\n"
         j += "  \"excludes\": [" + o.patterns.map { "\"\(Format.json($0))\"" }.joined(separator: ", ") + "],\n"
@@ -389,9 +435,11 @@ public enum Engine {
         if rename(work, snapDir) != 0 { throw Stop.fail("Could not finalize the snapshot: \(errText(errno))") }
         work = ""
 
-        var msg = "\(Format.num(files.count - failed)) files protected, \(Format.num(st.linked)) unchanged reused, \(Format.bytes(st.bytesWritten)) written."
+        // One destination keeps the full sentence; with two, each gets a compact clause so both fit the status panel.
+        var msg = brief ? "\(Format.num(files.count - failed)) files, \(Format.bytes(written)) written"
+                        : "\(Format.num(files.count - failed)) files protected, \(Format.num(linked)) unchanged reused, \(Format.bytes(written)) written."
         if failed > 0 {
-            msg += " \(Format.num(failed)) unreadable files skipped."
+            msg += brief ? ", \(Format.num(failed)) unreadable skipped" : " \(Format.num(failed)) unreadable files skipped."
             job.update { $0.warnings += failed }
         }
         // 5. Optional verification of what was written, then retention
@@ -399,19 +447,19 @@ public enum Engine {
             do {
                 var v = VerifyResult()
                 _ = try verifySnapshot(snapDir, job, &v)
-                msg += " " + v.summary
                 let n = v.bad + v.missing
+                msg += brief ? (n > 0 ? ", \(Format.num(n)) FAILED verification" : ", verified") : " " + v.summary
                 job.update { $0.warnings += n }
             } catch {
-                msg += " Verification was cancelled; the snapshot was kept."
+                msg += brief ? ", verification cancelled" : " Verification was cancelled; the snapshot was kept."
                 job.update { $0.warnings += 1 }
             }
         }
         if o.versioned {
             let n = prune(root, keep: o.keep, keepDays: o.keepDays, job: job)
-            if n > 0 { msg += " Removed \(Format.num(n)) old snapshot\(n == 1 ? "" : "s")." }
+            if n > 0 { msg += brief ? ", \(Format.num(n)) old removed" : " Removed \(Format.num(n)) old snapshot\(n == 1 ? "" : "s")." }
         }
-        return (msg, snapDir)
+        return (msg + (brief ? "." : ""), snapDir)
     }
 
     /// Retention: removes versioned snapshots beyond the newest `keep`, or older than `keepDays` (0 = no limit).

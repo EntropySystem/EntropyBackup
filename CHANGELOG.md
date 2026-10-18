@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.7.0
+**Firebox mode: no single point of failure.** Even a RAID NAS is one machine in one place, so a single backup folder can still lose everything. Firebox mode backs up to a second location as well, named after the fireproof boxes that backups were once kept in, off site, in case of fire.
+- **Backup page:** a **Firebox mode** switch next to *To*. Turning it on adds a **Firebox** folder row with a flame icon. The app warns when the Firebox is on the same drive as the backup folder, and refuses a Firebox that is the backup folder itself or sits inside the other destination's versions folder.
+- **Independent copies:** each destination gets its own complete snapshot chain (manifest, hard links, checksums, retention), read straight from the project and never copied from the other. On Windows both come from one scan and one shadow copy, so they show the same moment, and each file is hashed only once.
+- **No single point of failure:** if one destination cannot be reached (an unplugged drive, an offline NAS) or fails part-way, the other is still saved. The status panel reports "Backup incomplete — one destination failed" in red, `backup.log` records which one failed and why, and the command line exits with 1 (warnings). The run fails (exit 2) only if neither destination could be saved.
+- **Progress:** the status panel shows which destination is being written ("Primary 1/2", "Firebox 2/2", "Copying to Firebox: ..."), and when both are saved it says "Backup complete · both copies saved", with a short summary for each.
+- **Version History and Restore** have a **Primary | Firebox** switch, so you can browse, verify and restore from the Firebox when the primary is gone. The side panel is titled **Firebox History** while you are viewing it. Snapshots record `"firebox": true` in `backup.json`, and the Type row shows "Firebox".
+- **Automation:** the scheduled task backs up to the Firebox too (`--firebox`), and its summary and the ready-to-copy command include it.
+- **Command line:** `--firebox DIR` / `--no-firebox`. `prune` applies retention to both destinations. To list or verify the Firebox, pass its folder as `--to`.
+- macOS: the same Firebox mode, backing up to the primary first and then to the Firebox. Cancelling during the Firebox leg keeps the primary snapshot that is already finished.
+- CI: both platforms smoke-test Firebox mode, including a Firebox that cannot be reached.
+
 ## 1.6.1
 - **Code signing through SignPath.io is on the way.** The project has applied to the SignPath Foundation open-source program (free code signing, certificate by SignPath Foundation). The release build is ready to sign `EntropyBackup.exe` and `EntropyBackupCLI.exe` once the application is approved. **This release is not signed yet.**
 - Both executables now carry version information (Properties › Details): product name, description, company, version and copyright.

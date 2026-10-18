@@ -11,6 +11,7 @@ public final class Job {
     public struct State {
         public var kind = Kind.backup, phase = Phase.idle
         public var scanned = 0, copied = 0, linked = 0, skipped = 0, warnings = 0
+        public var legs = 1, leg = 0, failedLegs = 0  // backup destinations (2 in Firebox mode), the one being written, those not saved
         public var bytesWritten: Int64 = 0, workDone: Int64 = 0, workTotal: Int64 = 0
         public var current = "", message = "Choose a project and a backup destination.", resultPath = "", title = ""
         public var started = Date(), ended = Date()

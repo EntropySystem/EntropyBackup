@@ -94,6 +94,52 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(try String(contentsOfFile: snaps[0].dir + "/files/sub/b.txt"), "world", "pruning leaves linked files intact")
     }
 
+    func testFireboxKeepsAnIndependentSecondCopy() throws {
+        write("a.txt", "hello")
+        write("sub/b.txt", "world")
+        var o = options()
+        o.fire = tmp + "/fire"
+        let first = backup(o)
+        XCTAssertEqual(first.state.phase, .done, first.state.message)
+        XCTAssertEqual(first.exitCode, 0)
+        var primary = Snapshot.list(tmp + "/dst"), firebox = Snapshot.list(tmp + "/fire")
+        XCTAssertEqual(primary.count, 1)
+        XCTAssertEqual(firebox.count, 1)
+        XCTAssertFalse(primary[0].firebox)
+        XCTAssertTrue(firebox[0].firebox && firebox[0].verified && firebox[0].vBad == 0)
+        XCTAssertEqual(try String(contentsOfFile: firebox[0].dir + "/files/sub/b.txt"), "world")
+
+        sleep(1)
+        write("a.txt", "changed")
+        XCTAssertEqual(backup(o).exitCode, 0)
+        firebox = Snapshot.list(tmp + "/fire")
+        XCTAssertEqual(firebox.count, 2)
+        XCTAssertEqual(firebox[0].copied, 1, "the Firebox has its own incremental chain")
+        XCTAssertEqual(firebox[0].reused, 1)
+        var st = stat()
+        XCTAssertEqual(lstat(firebox[0].dir + "/files/sub/b.txt", &st), 0)
+        XCTAssertEqual(st.st_nlink, 2, "unchanged files link to the Firebox's own previous snapshot")
+
+        // The Firebox drive is gone: the primary is still saved, with a warning.
+        sleep(1)
+        var gone = o
+        gone.fire = "/nonexistent-entropy-firebox/fire"
+        let partial = backup(gone)
+        XCTAssertEqual(partial.state.phase, .done, partial.state.message)
+        XCTAssertEqual(partial.state.failedLegs, 1)
+        XCTAssertEqual(partial.exitCode, 1)
+        primary = Snapshot.list(tmp + "/dst")
+        XCTAssertEqual(primary.count, 3)
+
+        var same = o
+        same.fire = tmp + "/dst"
+        XCTAssertEqual(backup(same).state.phase, .failed, "the Firebox must differ from the backup folder")
+        XCTAssertEqual(CLI.run(["backup", "--from", tmp + "/src", "--to", tmp + "/dst", "--firebox", tmp + "/dst"]), 3)
+        XCTAssertEqual(CLI.run(["prune", "--to", tmp + "/dst", "--firebox", tmp + "/fire", "--keep", "1"]), 0)
+        XCTAssertEqual(Snapshot.list(tmp + "/dst").count, 1)
+        XCTAssertEqual(Snapshot.list(tmp + "/fire").count, 1)
+    }
+
     func testSecondWriterIsRefused() throws {
         let root = tmp + "/dst/EntropyBackup_Versions"
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)

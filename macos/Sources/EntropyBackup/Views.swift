@@ -7,6 +7,7 @@ enum Theme {
     static let text = Color(red: 0.95, green: 0.96, blue: 0.98)
     static let dim = Color(red: 0.64, green: 0.71, blue: 0.79)
     static let bad = Color(red: 1.0, green: 0.61, blue: 0.54)
+    static let flame = Color(red: 1.0, green: 0.64, blue: 0.36)
     static let field = Color.black.opacity(0.28)
 }
 
@@ -241,7 +242,7 @@ struct StatusPanel: View {
         if model.settings.from.isEmpty || model.settings.to.isEmpty { return "Set From and To on the Backup page first." }
         return "Snapshot \u{201C}\((model.settings.from as NSString).lastPathComponent)\u{201D} now."
     }
-    private func problem(_ s: Job.State) -> Bool { s.phase == .failed || (s.phase == .done && s.kind == .verify && s.warnings > 0) }
+    private func problem(_ s: Job.State) -> Bool { s.phase == .failed || (s.phase == .done && (s.failedLegs > 0 || (s.kind == .verify && s.warnings > 0))) }
     private func title(_ s: Job.State) -> String {
         let names: [[String]] = [
             ["Ready to back up", "Scanning project...", "Backing up files...", "Finalizing snapshot...", "Backup complete", "Backup failed", "Backup cancelled"],
@@ -249,14 +250,17 @@ struct StatusPanel: View {
             ["Ready to back up", "Preparing verification...", "Verifying checksums...", "Finalizing...", "Verification passed", "Verification failed", "Verification cancelled"],
         ]
         if s.phase == .done && s.kind == .verify && s.warnings > 0 { return "Verification found problems" }
-        return names[s.kind.rawValue][s.phase.rawValue]
+        let name = names[s.kind.rawValue][s.phase.rawValue]
+        guard s.kind == .backup && s.legs > 1 else { return name }
+        if s.phase == .done { return s.failedLegs > 0 ? "Backup incomplete \u{2014} one destination failed" : "Backup complete \u{00B7} both copies saved" }
+        return s.running ? name +(s.leg == 1 ? "  \u{00B7}  Firebox 2/2" : "  \u{00B7}  Primary 1/2") : name
     }
     private func line(_ s: Job.State) -> String {
         switch s.phase {
         case .idle:
             return model.settings.from.isEmpty || model.settings.to.isEmpty ? s.message : "Folders are set. Press Back Up Now to create a snapshot."
         case .scanning: return "Scanning: " + s.current
-        case .copying: return s.kind == .verify ? s.current : (s.kind == .restore ? "Restoring: " : "Copying: ") + s.current
+        case .copying: return s.kind == .verify ? s.current : (s.kind == .restore ? "Restoring: " : s.leg == 1 ? "Copying to Firebox: " : "Copying: ") + s.current
         case .finalizing: return s.current.isEmpty ? "Writing manifest and metadata..." : s.current
         default: return s.message
         }
@@ -277,10 +281,11 @@ struct FolderRow: View {
     let icon: String, title: String, hint: String
     @Binding var path: String
     let prompt: String
+    var tint = Theme.gold
 
     var body: some View {
         HStack(alignment: .bottom, spacing: 12) {
-            Image(systemName: icon).font(.title2).foregroundStyle(Theme.gold).frame(width: 30).padding(.bottom, 6)
+            Image(systemName: icon).font(.title2).foregroundStyle(tint).frame(width: 30).padding(.bottom, 6)
             VStack(alignment: .leading, spacing: 5) {
                 Text(title).font(.headline)
                 HStack {
@@ -305,13 +310,27 @@ struct BackupPage: View {
             FolderRow(icon: "folder", title: "From", hint: "The project folder to protect", path: $model.settings.from, prompt: "Back Up This Folder")
             FolderRow(icon: "externaldrive", title: "To", hint: "A backup folder, ideally on another drive", path: $model.settings.to, prompt: "Store Backups Here")
                 .onChange(of: model.settings.to) { model.refresh() }
+            Toggle(isOn: $model.settings.fireOn) {
+                Label("Firebox mode \u{2014} also back up to a second, independent location", systemImage: "flame")
+            }
+            .toggleStyle(.checkbox)
+            .padding(.leading, 42)
+            .onChange(of: model.settings.fireOn) { model.refresh() }
+            if model.settings.fireOn {
+                VStack(alignment: .trailing, spacing: 4) {
+                    FolderRow(icon: "flame", title: "Firebox", hint: "Another drive, a NAS or an off-site folder", path: $model.settings.fire,
+                              prompt: "Store Firebox Backups Here", tint: Theme.flame)
+                        .onChange(of: model.settings.fire) { model.refresh() }
+                    if !model.fireNote.isEmpty { Text(model.fireNote).font(.callout.weight(.semibold)).foregroundStyle(Theme.flame) }
+                }
+            }
             VStack(alignment: .leading, spacing: 6) {
                 Label("Description (optional)", systemImage: "doc.text").font(.headline)
                 TextEditor(text: $model.desc)
                     .scrollContentBackground(.hidden)
                     .padding(6)
                     .background(Theme.field, in: RoundedRectangle(cornerRadius: 9))
-                    .frame(height: 64)
+                    .frame(height: model.settings.fireOn ? 40 : 64)
                     .onChange(of: model.desc) { if model.desc.count > 500 { model.desc = String(model.desc.prefix(500)) } }
                 Text("\(model.desc.count) / 500").font(.caption).foregroundStyle(Theme.dim).frame(maxWidth: .infinity, alignment: .trailing)
             }
@@ -370,10 +389,25 @@ struct SnapshotCard: View {
 struct SnapshotList: View {
     @EnvironmentObject var model: AppModel
     var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if model.fireboxSet {
+                Picker("Show", selection: $model.viewFire) {
+                    Text("Primary").tag(false)
+                    Label("Firebox", systemImage: "flame").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: model.viewFire) { model.refresh() }
+            }
+            list
+        }
+    }
+    @ViewBuilder private var list: some View {
         if model.snapshots.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
-                Text(model.settings.to.isEmpty ? "No backup folder selected." : "No snapshots yet.").font(.headline)
-                Text(model.settings.to.isEmpty ? "Choose a backup folder on the Backup page to see its versions." : "Run your first backup and it will appear here.")
+                Text(model.viewDest.isEmpty ? "No backup folder selected." : "No snapshots yet.").font(.headline)
+                Text(model.viewDest.isEmpty ? "Choose a backup folder on the Backup page to see its versions."
+                     : model.viewFire ? "The Firebox has no snapshots yet, or its drive is not connected." : "Run your first backup and it will appear here.")
                     .foregroundStyle(Theme.dim)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -405,7 +439,7 @@ struct HistoryPage: View {
             Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 8) {
                 row("Description", s.desc)
                 row("Source", s.source)
-                row("Type", s.type.isEmpty ? "" : s.type == "full" ? "Full copy" : "Incremental")
+                row("Type", s.type.isEmpty ? "" : (s.type == "full" ? "Full copy" : "Incremental") + (s.firebox ? "  \u{00B7}  Firebox" : ""))
                 row("Files", s.files > 0 ? Format.num(s.files) : "")
                 row("Copied", Format.num(s.copied))
                 row("Unchanged", Format.num(s.reused) + " (linked)")

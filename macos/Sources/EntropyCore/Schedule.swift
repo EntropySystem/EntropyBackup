@@ -36,9 +36,12 @@ public enum Schedule {
         var when: [String: Int] = ["Minute": s.schedMin]
         if s.schedMode >= 2 { when["Hour"] = s.schedHour }
         if s.schedMode == 3 { when["Weekday"] = s.schedDay }  // 0 = Sunday, as in launchd
+        let fire = s.fireOn && !s.fire.isEmpty ? normPath(s.fire) : ""
+        if !fire.isEmpty, let why = Engine.fireboxConflict(s.to, fire) { return why }
         let job: [String: Any] = [
             "Label": label,
-            "ProgramArguments": [executable, "backup", "--scheduled", "--from", normPath(s.from), "--to", normPath(s.to)],
+            "ProgramArguments": [executable, "backup", "--scheduled", "--from", normPath(s.from), "--to", normPath(s.to)]
+                + (fire.isEmpty ? ["--no-firebox"] : ["--firebox", fire]),
             "StartCalendarInterval": when,
             "StandardOutPath": join(Settings.directory, "scheduled.log"),
             "StandardErrorPath": join(Settings.directory, "scheduled.log"),
@@ -64,6 +67,7 @@ public enum Schedule {
         let mode = when["Weekday"] != nil ? 3 : when["Hour"] != nil ? 2 : 1
         st.exists = true
         st.summary = describe(mode: mode, hour: when["Hour"] ?? 0, minute: when["Minute"] ?? 0, day: when["Weekday"] ?? 0) + ":  \(arg("--from"))  →  \(arg("--to"))"
+            + (arg("--firebox").isEmpty ? "" : "  +  Firebox \(arg("--firebox"))")
         var c = DateComponents()
         c.minute = when["Minute"] ?? 0
         if mode >= 2 { c.hour = when["Hour"] ?? 0 }
