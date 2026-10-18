@@ -1,11 +1,11 @@
 cmake_minimum_required(VERSION 3.24)
-project(EntropyBackup VERSION 1.6.0 LANGUAGES CXX)
+project(EntropyBackup VERSION 1.6.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # EntropyBackup.exe is the windowed app; EntropyBackupCLI.exe is the same source built for the console,
 # so scripts and shells wait for it and get its exit code.
-add_executable(EntropyBackup WIN32 src/main.cpp)
-add_executable(EntropyBackupCLI src/main.cpp)
+add_executable(EntropyBackup WIN32 src/main.cpp src/version.rc)
+add_executable(EntropyBackupCLI src/main.cpp src/version.rc)
 target_compile_definitions(EntropyBackupCLI PRIVATE ENTROPY_CLI)
 foreach(t EntropyBackup EntropyBackupCLI)
   target_compile_definitions(${t} PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)

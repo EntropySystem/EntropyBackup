@@ -42,7 +42,7 @@
 
 using Microsoft::WRL::ComPtr;
 
-static const wchar_t* APP_VERSION = L"1.6.0";
+static const wchar_t* APP_VERSION = L"1.6.1";
 static const wchar_t* CLS = L"EntropyBackupGlassWindow";
 static const float DW = 1480.f, DH = 950.f;   // design canvas, scaled uniformly to the window
 static const float PI = 3.14159265f;
