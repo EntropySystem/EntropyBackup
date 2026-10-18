@@ -4,7 +4,7 @@ import SwiftUI
 
 /// App state: settings, snapshots and the running job, polled from the worker while it runs.
 final class AppModel: ObservableObject {
-    @Published var settings: Settings { didSet { if settings != oldValue { settings.save() } } }
+    @Published var settings: EntropyCore.Settings { didSet { if settings != oldValue { settings.save() } } }
     @Published var snapshots: [Snapshot] = []
     @Published var selected: String?
     @Published var state = Job.State()
@@ -16,7 +16,7 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
 
     init() {
-        settings = Settings.load()
+        settings = EntropyCore.Settings.load()
         refresh()
         schedule = Schedule.status()
     }

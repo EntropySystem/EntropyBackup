@@ -573,7 +573,7 @@ struct SettingsPage: View {
             HStack {
                 Text("Excludes").sectionTitle()
                 Spacer()
-                Button("Reset to Defaults") { model.settings.excludes = Settings.defaultExcludes }
+                Button("Reset to Defaults") { model.settings.excludes = EntropyCore.Settings.defaultExcludes }
             }
             Text("One pattern per line. A plain name such as node_modules matches at any depth; * and ? are wildcards; patterns containing / match the path relative to the project (e.g. src/generated/*). Lines starting with # are comments.")
                 .font(.callout).foregroundStyle(Theme.dim)
@@ -582,7 +582,7 @@ struct SettingsPage: View {
                 .scrollContentBackground(.hidden)
                 .padding(8)
                 .background(Theme.field, in: RoundedRectangle(cornerRadius: 10))
-            Text("\(Excludes.patterns(model.settings.excludes).count) active patterns.  Settings and backup.log live in \(Settings.directory).")
+            Text("\(Excludes.patterns(model.settings.excludes).count) active patterns.  Settings and backup.log live in \(EntropyCore.Settings.directory).")
                 .font(.caption).foregroundStyle(Theme.dim)
         }
         .toggleStyle(.checkbox)
@@ -616,7 +616,7 @@ struct AboutPage: View {
             HStack {
                 Text("Developed by Peter V. Odintsov").fontWeight(.semibold)
                 Spacer()
-                Button { model.reveal(Settings.directory) } label: { Label("Open Data Folder", systemImage: "folder") }
+                Button { model.reveal(EntropyCore.Settings.directory) } label: { Label("Open Data Folder", systemImage: "folder") }
             }
         }
     }
