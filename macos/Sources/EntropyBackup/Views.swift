@@ -253,7 +253,7 @@ struct StatusPanel: View {
         let name = names[s.kind.rawValue][s.phase.rawValue]
         guard s.kind == .backup && s.legs > 1 else { return name }
         if s.phase == .done { return s.failedLegs > 0 ? "Backup incomplete \u{2014} one destination failed" : "Backup complete \u{00B7} both copies saved" }
-        return s.running ? name +(s.leg == 1 ? "  \u{00B7}  Firebox 2/2" : "  \u{00B7}  Primary 1/2") : name
+        return s.running ? name + (s.leg == 1 ? "  \u{00B7}  Firebox 2/2" : "  \u{00B7}  Primary 1/2") : name
     }
     private func line(_ s: Job.State) -> String {
         switch s.phase {
